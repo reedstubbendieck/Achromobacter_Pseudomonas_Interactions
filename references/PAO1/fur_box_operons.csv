@@ -1,0 +1,24 @@
+promoter_gene,operon,members,note
+PA4896,PA4896-PA4895,"PA4896,PA4895",
+hxuI,hxuI-hxuR,"PA1300,PA1301",
+fecI,fecI-fecR,"PA3899,PA3900",
+hasI,hasI,PA3410,
+PA4471,PA4471-fumC1-PA4469-sodM-PA4467,"PA4471,PA4470,PA4469,PA4468,PA4467",
+foxI,PA2469-foxI-foxR,"PA2469,PA2468,PA2467",
+fvbA,fvbA,PA4156,
+fiuI,fiuI-fiuR,"PA0472,PA0471",
+PA4515,PA4515-PA4516,"PA4515,PA4516",
+fpvR,fpvR,PA2388,
+prrH,prrH,PA4704.3,ncRNA; locus tag from the PAO1 annotation
+fptA,fptABCX,"PA4218,PA4219,PA4220,PA4221",locus tags as given
+hasR,hasR,PA3408,
+PA5217,PA5218-PA5217-PA5216,"PA5218,PA5217,PA5216",
+pchD,pchDCBA,"PA4228,PA4229,PA4230,PA4231",
+pvdS,pvdS,PA2426,
+PA0929,PA0929-PA0930,"PA0929,PA0930",
+tonB1,tonB1,PA5531,
+PA1322,PA1322,PA1322,
+PA0968,ybgC-tolQRA,"PA0968,PA0969,PA0970,PA0971",ybgC read as PA0968; the source list said PA0989 which has no tol context
+fepB,fepB-fepD-fepG,"PA4159,PA4160,PA4161",
+phuS,phuSTUVW,"PA4709,PA4708,PA4707,PA4706,PA4705",
+fiuR,fiuI-fiuR,"PA0472,PA0471",same operon as the fiuI row; the two Fur boxes are both in it

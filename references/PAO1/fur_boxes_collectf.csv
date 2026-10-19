@@ -1,0 +1,27 @@
+tier,start,end,strand,sequence,target_locus_tags,target_gene_names,evidence,pmid,source_db
+1,5000327,5000345,-,GAAAACAATAATCAATCTC,PA4467-PA4471,fagA/fumC1/sodM operon,"DNase footprinting; EMSA; genomic SELEX; RNase protection",8633080,CollecTF
+1,5000327,5000345,-,GAAAACAATAATCAATCTC,PA4467-PA4471,fagA/fumC1/sodM operon,"consensus search; DNase footprinting; EMSA; primer extension",9045799,CollecTF
+1,1015908,1015926,+,ACGATTGCTAATCAATCTT,PA0924-PA0930,gacS/ldhA region,"DNase footprinting; EMSA; genomic SELEX; RNase protection",8633080,CollecTF
+1,1433131,1433149,-,GTTATTGAGAATCATTGGC,PA1317-PA1322,cyoABCDE; PA1322 TonB-dependent receptor,"DNase footprinting; EMSA; genomic SELEX; RNase protection",8633080,CollecTF
+1,5283967,5283985,+,GGAAATGAGAATCATTATT,PA4704.1/PA4704.2/PA4706-PA4709,prrF1; prrF2; phuT; hemin ABC transporter,"DNase footprinting; EMSA; genomic SELEX; RNase protection",8633080,CollecTF
+1,1053333,1053351,+,GAAGATGGTAATTAATTGC,PA0964/PA0969-PA0973,pmpR; tolQRAB; oprL region,"DNase footprinting; EMSA; genomic SELEX; RNase protection",8633080,CollecTF
+1,,,,TCTTCTGATAATTATTATC,PA5531/PA5532,tonB1,"DNase footprinting; EMSA; genomic SELEX",8633080,CollecTF
+1,,,,CTGAATGATAATAATTATC,PA5531/PA5532,tonB1,"DNase footprinting; EMSA; genomic SELEX",8633080,CollecTF
+1,,,,ACGAACGTGAATCATTCTC,PA5531/PA5532,tonB1,"DNase footprinting; EMSA; genomic SELEX",8633080,CollecTF
+2,2722073,2722091,+,GTAATTGACAATCATTATC,PA2426,pvdS,"consensus search; DNA-array; beta-gal reporter",12207696,CollecTF
+2,4742370,4742388,-,GGAAATGAGATTTATTATC,PA4227-PA4231,pchR; pchDCBA,"consensus search; DNA-array",12207696,CollecTF
+2,4726833,4726851,-,CATAATGATAAGCATTATC,PA4221/PA4224-PA4226,fptA; pchEFG,"consensus search; DNA-array",12207696,CollecTF
+2,2640955,2640973,+,TAAATTTATAATAATTCTC,PA2385-PA2392,fpvI; fpvR; pvdRT-opmQ; pvdP,"consensus search; DNA-array",12207696,CollecTF
+2,2640961,2640979,-,CTTGATGAGAATTATTATA,PA2385-PA2392,fpvI; fpvR; pvdRT-opmQ; pvdP,"consensus search; DNA-array",12207696,CollecTF
+2,2639621,2639639,-,GATAATGGCGATCTTCATC,PA2385-PA2387,pvdQ; pvdA; fpvI,"consensus search; DNA-array",12207696,CollecTF
+2,3817363,3817381,+,TGTAATAAGAATCAGTCTC,PA3407/PA3408,hasAp; hasR,"consensus search; DNA-array; beta-gal reporter",12207696,CollecTF
+2,3819144,3819162,+,TTTTATGATAATGATTTTC,PA3409/PA3410,hasS/hasI (ECF sigma and transmembrane sensor),"consensus search; DNA-array",12207696,CollecTF
+2,2786909,2786927,-,GACAATGCGATTCATTATC,PA2466-PA2468,foxA; foxR; foxI,"consensus search; DNA-array",12207696,CollecTF
+2,4367231,4367249,+,TAAAATGATAACTATTATC,PA3899-PA3901,ECF sigma; transmembrane sensor; fecA,"consensus search; DNA-array",12207696,CollecTF
+2,5491221,5491239,+,GCAAATGAAAACTATTATC,PA4895/PA4896,transmembrane sensor; ECF sigma factor,"consensus search; DNA-array",12207696,CollecTF
+2,1409836,1409854,-,GCGAATGATAATACATATC,PA1300-PA1302,ECF sigma; transmembrane sensor; heme utilization protein,"consensus search; DNA-array; beta-gal reporter",12207696,CollecTF
+2,5056043,5056061,+,TCCAATGCAAATCAATATC,PA4514-PA4516,iron outer membrane receptor; hydroxylase,"consensus search; DNA-array; beta-gal reporter",12207696,CollecTF
+2,5875616,5875634,+,ACGAATGATAAGAAATCTC,PA5216/PA5217,iron ABC transporter,"consensus search; DNA-array",12207696,CollecTF
+2,4885993,4886011,-,GCTGATTACCATCATGATG,feoB region,feoB,"consensus search; DNA-array; beta-gal reporter",12207696,CollecTF
+2,534061,534079,+,AAAAACGAGAATTATTCGC,PA0471/PA0472 region,fiuR/fiuI region,"consensus search; DNA-array; beta-gal reporter",12207696,CollecTF
+3,4652468,4652486,+,CCAAATGGGAATGACTCTC,PA4156/PA4158-PA4161,TonB-dependent receptor; fepBCDG,"FURTA; quantitative real-time PCR",21546589,CollecTF

@@ -1,0 +1,2215 @@
+---
+title: "Siderophore-Mediated Competition Between Cystic Fibrosis Pathogens Increases Virulence Factor Production"
+author: "Reed Stubbendieck"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+suppressPackageStartupMessages({
+  library(circlize)
+  library(ComplexHeatmap)
+  library(cowplot)
+  library(DESeq2)
+  library(egg)
+  library(ggrepel)
+  library(ggseqlogo)
+  library(ggtext)
+  library(gridExtra)
+  library(gtable)
+  library(matrixStats)
+  library(multcompView)
+  library(patchwork)
+  library(ape)
+  library(scales)
+  library(scatterpie)
+  library(tidyverse)
+})
+
+set.seed(567809)
+```
+
+## Paths
+
+```{r paths, include=FALSE}
+dir.create("./figures", showWarnings = FALSE)
+dir.create("./tables", showWarnings = FALSE)
+
+rnaseq_work <- Sys.getenv("RNASEQ_WORK",
+                          unset = "./derivedData/rnaseq/intermediates")
+have_kallisto <- dir.exists(file.path(rnaseq_work, "kallisto"))
+have_dds      <- file.exists(file.path(rnaseq_work, "dds.rds"))
+have_motifs   <- dir.exists(file.path(rnaseq_work, "motifs"))
+
+# the rebuild path only; without them every chunk reads the committed tables
+if (have_kallisto) { library(tximport); library(apeglm) }
+
+```
+
+## Shared Style
+
+```{r ggtheme, include=FALSE}
+HL_COLS <- c("Iron" = "#911c43", "Virulence" = "#e3754f",
+             "Secondary Metabolism" = "#4b86b8")
+
+pathogen_palette <- c("Pseudomonas"      = "#e9f5a3",
+                      "Stenotrophomonas" = "#4b86b8",
+                      "Burkholderia"     = "#c54a53",
+                      "Achromobacter"    = "#911c43",
+                      "Staphylococcus"   = "#7dc0a7",
+                      "Haemophilus"      = "#b5dca9")
+
+SPECIES_COLS <- c("A. dolens"       = "#c3c0d6", "A. insolitus"    = "#a3bdd6",
+                  "A. insuavis"     = "#e0978c", "A. pulmonis"     = "#ecc391",
+                  "A. ruhlandii"    = "#bdd29c", "A. spanius"      = "#efebac",
+                  "A. xylosoxidans" = "#a6cdc3")
+
+FC_CUT  <- 1
+FDR_CUT <- 0.05
+SEED    <- 567809
+
+PANEL_IN <- 3.2
+
+AXIS_TITLE_PT   <- 11
+AXIS_TEXT_PT    <- 10
+LEGEND_TITLE_PT <- 9
+LEGEND_TEXT_PT  <- 9
+TAG_PT          <- 14
+
+LABEL_PT <- 8
+LABEL_MM <- LABEL_PT / .pt
+
+GUIDE_COL <- "gray65"
+GUIDE_LW  <- 0.35
+
+base_theme <- function(bs = 11, lw = 0.4) {
+  theme_classic(base_size = bs) +
+    theme(axis.text = element_text(color = "black", size = AXIS_TEXT_PT),
+          axis.title = element_text(color = "black", size = AXIS_TITLE_PT),
+          axis.line = element_blank(),
+          panel.border = element_rect(fill = NA, color = "black", linewidth = lw),
+          axis.ticks = element_line(linewidth = lw),
+          legend.title = element_text(size = LEGEND_TITLE_PT),
+          legend.text = element_text(size = LEGEND_TEXT_PT),
+          legend.key.height = unit(0.32, "cm"),
+          legend.key.width = unit(0.32, "cm"),
+          legend.position = "bottom",
+          legend.justification = "center", legend.box = "vertical",
+          legend.spacing.y = unit(1, "pt"), legend.margin = margin(1, 1, 1, 1),
+          plot.margin = margin(6, 24, 6, 6))
+}
+
+XLAB_LFC <- expression(log[2]~"Fold Change (Coculture/Monoculture)")
+YLAB_Q   <- expression(-log[10]~"BH-Adjusted"~italic(P)*"-Value")
+SIZE_LAB <- expression(log[10]~"Normalized Count")
+
+TC_LOWER <- c("a", "an", "and", "as", "at", "but", "by", "for", "from", "in",
+              "into", "nor", "of", "on", "or", "per", "the", "to", "via",
+              "vs", "with")
+
+title_case <- function(x) {
+  vapply(x, function(s) {
+    w <- strsplit(s, " ", fixed = TRUE)[[1]]
+    paste(vapply(seq_along(w), function(i) {
+      tok <- w[i]
+      if (grepl("[A-Z]", tok)) return(tok)
+      if (i > 1 && tolower(gsub("[^[:alnum:]]", "", tok)) %in% TC_LOWER)
+        return(tolower(tok))
+      sub("([[:alpha:]])", "\\U\\1", tok, perl = TRUE)
+    }, character(1)), collapse = " ")
+  }, character(1), USE.NAMES = FALSE)
+}
+
+fmt_p <- function(p) {
+  if (is.na(p)) return("italic(P)*\"=NA\"")
+  num <- if (p < 0.001) "\"<0.001\""
+         else paste0("\"=", formatC(p, format = "f", digits = 3), "\"")
+  paste0("italic(P)*", num)
+}
+
+bracket <- function(x1, x2, y, label, size, lw, yr) {
+  list(
+    annotate("segment", x = x1, xend = x2, y = y, yend = y, linewidth = lw),
+    annotate("text", x = (x1 + x2) / 2, y = y + 0.01 * yr,
+             label = label, size = size, vjust = 0, parse = TRUE)
+  )
+}
+```
+
+```{r figure_helpers, include=FALSE}
+panel_tag <- function(lab) {
+  grid::textGrob(lab, x = grid::unit(5.5, "pt"),
+                 y = grid::unit(1, "npc") - grid::unit(3, "pt"),
+                 hjust = 0, vjust = 1,
+                 gp = grid::gpar(fontface = "bold", fontsize = TAG_PT))
+}
+
+AS_GROB <- theme(plot.background = element_blank(),
+                 legend.background = element_blank(),
+                 legend.key = element_blank())
+
+align_panels <- function(gs, tag_space = 0.22) {
+  panel_left <- function(g) {
+    l <- min(g$layout$l[grepl("^panel", g$layout$name)])
+    if (l <= 1) 0 else
+      grid::convertWidth(sum(g$widths[seq_len(l - 1)]), "in", valueOnly = TRUE)
+  }
+  pl <- vapply(gs, panel_left, numeric(1))
+  gs <- lapply(seq_along(gs), function(i) {
+    gtable::gtable_add_cols(gs[[i]], unit(max(pl) - pl[i] + tag_space, "in"),
+                            pos = 0)
+  })
+  tw <- vapply(gs, function(g)
+    grid::convertWidth(sum(g$widths), "in", valueOnly = TRUE), numeric(1))
+  lapply(seq_along(gs), function(i) {
+    d <- max(tw) - tw[i]
+    if (d > 1e-6) gtable::gtable_add_cols(gs[[i]], unit(d, "in")) else gs[[i]]
+  })
+}
+
+add_tags <- function(arr, labels = LETTERS) {
+  pan <- arr$layout[grepl("^panel", arr$layout$name), , drop = FALSE]
+  pan <- pan[order(pan$t, pan$l), ]
+  for (i in seq_len(min(nrow(pan), length(labels)))) {
+    first_in_row <- i == 1 || pan$t[i] != pan$t[i - 1]
+    col <- if (first_in_row) 1 else pan$l[i - 1] + 1
+    arr <- gtable::gtable_add_grob(arr, panel_tag(labels[i]),
+                                   t = pan$t[i], l = col, clip = "off",
+                                   name = paste0("tag_", labels[i]))
+  }
+  arr
+}
+
+safe_write_tsv <- function(x, file, ...) {
+  ok <- try(write_tsv(x, file, ...), silent = TRUE)
+  if (inherits(ok, "try-error"))
+    warning("could not write ", file, " - is it open in a viewer?", call. = FALSE)
+  invisible(ok)
+}
+
+save_grob <- function(g, out, w, h) {
+  ok <- try(ggsave(out, g, width = w, height = h, device = cairo_pdf,
+                   bg = "white"), silent = TRUE)
+  if (inherits(ok, "try-error"))
+    warning("could not write ", out, " - is it open in a viewer?", call. = FALSE)
+}
+
+save_panel <- function(p, out, panel_in = PANEL_IN) {
+  gt <- egg::set_panel_size(p, width = unit(panel_in, "in"),
+                            height = unit(panel_in, "in"))
+  w <- grid::convertWidth(sum(gt$widths), "in", valueOnly = TRUE)
+  h <- grid::convertHeight(sum(gt$heights), "in", valueOnly = TRUE)
+  ok <- try(ggsave(out, p, width = w, height = h, device = cairo_pdf),
+            silent = TRUE)
+  if (inherits(ok, "try-error"))
+    warning("could not write ", out, " - is it open in a viewer?", call. = FALSE)
+}
+
+```
+
+## Load Data
+
+```{r load_data, include=FALSE}
+# --- 16S rRNA gene amplicon metadata and mothur taxonomy ---
+cf_metadata <- read.csv(
+  "./rawData/16S_rRNA_gene_amplicon_studies/16S_CF_achromo_pseudo_microbiome.csv",
+  stringsAsFactors = FALSE)
+mothur_files <- list.files("./derivedData/mothur_output",
+                           pattern = "\\.tax\\.summary$", full.names = TRUE)
+stopifnot(length(mothur_files) > 0)
+
+# --- Achromobacter strain metadata and comparative genomics ---
+achromo_md <- read.csv("./rawData/Achromobacter_metadata.csv",
+                       check.names = FALSE, stringsAsFactors = FALSE)
+achromo_md$key <- gsub(" ", "", achromo_md$Strain)
+
+bigscape_pa <- as.matrix(read.table("./derivedData/bigscape/absence_presence_clean.tsv",
+                                    header = TRUE, sep = "\t", row.names = 1,
+                                    check.names = FALSE))
+# BiG-SCAPE
+gcf_roles <- read_tsv("./derivedData/bigscape/family_roles.tsv", show_col_types = FALSE)
+ALC_FAM <- gcf_roles$fam[gcf_roles$role == "alc"]
+MET_FAM <- gcf_roles$fam[gcf_roles$role == "nrp_metallophore"]
+MET_STRAIN <- "DSM26089"
+
+alcaligin_hits <- read_tsv(
+  "./derivedData/alcaligin_pathway_genes/pathway_gene_hits.tsv",
+  show_col_types = FALSE)
+
+# --- PAO1 reference annotation ---
+pao1_pathways <- read_tsv("./references/PAO1/pathways.txt",
+                          show_col_types = FALSE, name_repair = "unique_quiet")
+names(pao1_pathways) <- make.names(names(pao1_pathways))
+
+pao1_vf <- read_csv("./references/PAO1/virulenceFactors.csv",
+                    show_col_types = FALSE, name_repair = "unique_quiet")
+names(pao1_vf) <- make.names(names(pao1_vf))
+
+fur_collectf <- read_csv("./references/PAO1/fur_boxes_collectf.csv",
+                         show_col_types = FALSE)
+
+# --- RNA-seq ---
+rnaseq_samples <- read_tsv("./rawData/rnaseq/samples.tsv",
+                           col_types = cols(.default = col_character())) %>%
+  mutate(condition = factor(condition, levels = c("monoculture", "coculture")))
+stopifnot(!any(duplicated(rnaseq_samples$sample)))
+
+# --- Proteomics ---
+prot_volcano <- read_tsv("./derivedData/proteomics/volcano_plot_data.tsv",
+                         show_col_types = FALSE)
+```
+
+## 16S rRNA Gene Amplicon Processing
+
+```{r microbiota_processing, include=FALSE}
+parse_tax_summary <- function(fp) {
+  read_tsv(fp, col_types = cols(.default = "c"), show_col_types = FALSE) %>%
+    mutate(taxlevel = as.integer(taxlevel), reads = as.integer(total)) %>%
+    filter(taxlevel == 6L, !str_detect(taxon, "unclassified")) %>%
+    dplyr::select(taxon, reads) %>%
+    mutate(sample = sub("\\.tax\\.summary$", "", basename(fp)))
+}
+
+get_total_reads <- function(fp) {
+  read_tsv(fp, col_types = cols(.default = "c"), show_col_types = FALSE,
+           n_max = 2) %>%
+    filter(as.integer(taxlevel) == 0L) %>%
+    transmute(sample = sub("\\.tax\\.summary$", "", basename(fp)),
+              total_reads = as.integer(total))
+}
+
+keep_samples <- map_dfr(mothur_files, get_total_reads) %>%
+  filter(total_reads >= 1000) %>% pull(sample)
+all_genera <- map_dfr(mothur_files, parse_tax_summary) %>%
+  filter(sample %in% keep_samples)
+
+genus_matrix <- all_genera %>%
+  pivot_wider(id_cols = sample, names_from = taxon,
+              values_from = reads, values_fill = 0L) %>%
+  column_to_rownames("sample") %>%
+  as.matrix()
+
+row_totals <- rowSums(genus_matrix)
+row_totals[row_totals == 0] <- NA
+genus_matrix[sweep(genus_matrix, 1, row_totals, FUN = "/") < 0.001] <- 0L
+
+ra <- sweep(genus_matrix, 1, rowSums(genus_matrix), "/") * 100
+ra[is.nan(ra)] <- 0
+
+cf_pathogens <- intersect(c("Pseudomonas", "Staphylococcus", "Burkholderia",
+                            "Stenotrophomonas", "Achromobacter", "Haemophilus"),
+                          colnames(ra))
+```
+
+## Coinfection and Lung Function
+
+```{r coinfection_groups, include=FALSE}
+group_levels4 <- c("No pathogen", "Pseudomonas only", "Achromobacter only", "Both")
+group_cols4 <- c("No pathogen" = "#d9d9d9", "Pseudomonas only" = "#e9f5a3",
+                 "Achromobacter only" = "#911c43", "Both" = "#6c8197")
+label_templates4 <- c("No pathogen"        = "No pathogen",
+                      "Pseudomonas only"   = "<i>Pseudomonas</i> only",
+                      "Achromobacter only" = "<i>Achromobacter</i> only",
+                      "Both"               = "Both Pathogens")
+
+build_groups <- function(thr) {
+  tibble(
+    Run       = rownames(ra),
+    pseudo    = ra[, "Pseudomonas"]   >= thr,
+    achro     = ra[, "Achromobacter"] >= thr,
+    pseudo_ra = ra[, "Pseudomonas"],
+    achro_ra  = ra[, "Achromobacter"],
+    any_path  = as.logical(rowSums(ra[, cf_pathogens, drop = FALSE] >= thr) > 0)
+  ) %>%
+    inner_join(cf_metadata %>% dplyr::select(Run, FEV1), by = "Run") %>%
+    mutate(FEV1 = suppressWarnings(as.numeric(FEV1))) %>%
+    filter(!is.na(FEV1)) %>%
+    mutate(grp = factor(case_when(
+      !any_path        ~ "No pathogen",
+       pseudo & !achro ~ "Pseudomonas only",
+      !pseudo &  achro ~ "Achromobacter only",
+       pseudo &  achro ~ "Both",
+      TRUE             ~ NA_character_), levels = group_levels4)) %>%
+    filter(!is.na(grp))
+}
+
+fev1_df <- build_groups(1)
+
+n4 <- fev1_df %>% count(grp) %>% deframe()
+axis_labels4 <- setNames(
+  vapply(group_levels4, function(g)
+    paste0(label_templates4[[g]], "<br/>(N=", n4[[g]], ")"), character(1)),
+  group_levels4)
+
+kw_fev1 <- kruskal.test(FEV1 ~ grp, data = fev1_df)
+pw_fev1 <- pairwise.wilcox.test(fev1_df$FEV1, fev1_df$grp,
+                                p.adjust.method = "BH", exact = FALSE)$p.value
+
+```
+
+### Dose Response Among the Coinfected
+
+```{r coinfection_dose, include=FALSE}
+coinf <- fev1_df %>% filter(grp == "Both") %>%
+  mutate(cumulative    = pseudo_ra + achro_ra,
+         Achromobacter = achro_ra, Pseudomonas = pseudo_ra,
+         Other         = pmax(0, 100 - pseudo_ra - achro_ra))
+
+sp_dose <- suppressWarnings(cor.test(coinf$FEV1, coinf$cumulative,
+                                     method = "spearman"))
+```
+
+### Severe Disease
+
+```{r coinfection_severity, include=FALSE}
+SEVERE_CUT <- 30   # FEV1 pp threshold for severe disease
+
+sev_ci <- fev1_df %>% group_by(grp) %>%
+  summarize(n = n(), x = sum(FEV1 <= SEVERE_CUT), .groups = "drop") %>%
+  rowwise() %>%
+  mutate(pct = 100 * x / n,
+         lo  = 100 * binom.test(x, n)$conf.int[1],
+         hi  = 100 * binom.test(x, n)$conf.int[2]) %>% ungroup()
+
+sev_n <- setNames(sev_ci$n, as.character(sev_ci$grp))
+sev_x <- setNames(sev_ci$x, as.character(sev_ci$grp))
+fisher_vs_both <- function(g) fisher.test(matrix(c(
+  sev_x[[g]], sev_n[[g]] - sev_x[[g]],
+  sev_x[["Both"]], sev_n[["Both"]] - sev_x[["Both"]]), nrow = 2))$p.value
+sev_padj <- p.adjust(c(fisher_vs_both("Achromobacter only"),
+                       fisher_vs_both("Pseudomonas only"),
+                       fisher_vs_both("No pathogen")), "BH")
+
+chi_sev <- suppressWarnings(chisq.test(table(fev1_df$grp,
+                                             fev1_df$FEV1 <= SEVERE_CUT)))
+```
+
+### Specificity: Which Co-Pathogen
+
+```{r coinfection_specificity, include=FALSE}
+copathogens <- intersect(c("Staphylococcus", "Burkholderia", "Stenotrophomonas",
+                           "Achromobacter", "Haemophilus"), colnames(ra))
+
+adj_dat <- tibble(Run = rownames(ra)) %>%
+  bind_cols(as_tibble(ra[, c("Pseudomonas", copathogens)] >= 1)) %>%
+  inner_join(cf_metadata %>% dplyr::select(Run, FEV1, Age, BioProject),
+             by = "Run") %>%
+  mutate(FEV1 = suppressWarnings(as.numeric(FEV1)),
+         Age  = suppressWarnings(as.numeric(Age))) %>%
+  filter(!is.na(FEV1), Pseudomonas, !is.na(Age), !is.na(BioProject),
+         BioProject != "") %>%
+  mutate(BioProject = factor(BioProject))
+
+n_present_adj <- vapply(copathogens, function(g) sum(adj_dat[[g]]), integer(1))
+
+m_spec <- lm(as.formula(paste("FEV1 ~", paste(copathogens, collapse = " + "),
+                              "+ Age + BioProject")), data = adj_dat)
+co_spec <- summary(m_spec)$coefficients
+ci_spec <- confint(m_spec)
+cn <- paste0(copathogens, "TRUE"); keep <- cn %in% rownames(co_spec)
+
+res_spec <- tibble(pathogen = copathogens[keep],
+                   diff = co_spec[cn[keep], "Estimate"],
+                   lo   = ci_spec[cn[keep], 1], hi = ci_spec[cn[keep], 2],
+                   p    = co_spec[cn[keep], "Pr(>|t|)"]) %>%
+  mutate(p_adj = p.adjust(p, "BH")) %>%
+  arrange(diff) %>%
+  mutate(pathogen = factor(pathogen, levels = pathogen),
+         plab = vapply(p_adj, fmt_p, character(1)))
+
+```
+
+### Threshold Sensitivity
+
+```{r coinfection_thresholds, include=FALSE}
+thresholds <- c(0.1, 0.5, 1, 2, 5)
+copath_all <- intersect(setdiff(cf_pathogens, "Pseudomonas"), colnames(ra))
+
+res_thresh <- map_dfr(thresholds, function(t) {
+  d <- tibble(Run = rownames(ra)) %>%
+    bind_cols(as_tibble(ra[, c("Pseudomonas", copath_all)] >= t)) %>%
+    inner_join(cf_metadata %>% dplyr::select(Run, FEV1, Age, BioProject),
+               by = "Run") %>%
+    mutate(FEV1 = suppressWarnings(as.numeric(FEV1)),
+           Age  = suppressWarnings(as.numeric(Age))) %>%
+    filter(!is.na(FEV1), Pseudomonas, !is.na(Age), !is.na(BioProject),
+           BioProject != "") %>%
+    mutate(BioProject = factor(BioProject))
+  m  <- lm(as.formula(paste("FEV1 ~", paste(copath_all, collapse = " + "),
+                            "+ Age + BioProject")), data = d)
+  cm <- summary(m)$coefficients; ci <- confint(m)
+  tibble(threshold = t,
+         diff = cm["AchromobacterTRUE", "Estimate"],
+         lo   = ci["AchromobacterTRUE", 1], hi = ci["AchromobacterTRUE", 2],
+         p    = cm["AchromobacterTRUE", "Pr(>|t|)"],
+         n_achro = sum(d$Achromobacter))
+}) %>%
+  mutate(p_adj = p.adjust(p, "BH"),
+         thr   = factor(paste0(threshold, "%"), levels = rev(paste0(thresholds, "%"))),
+         plab  = vapply(p_adj, fmt_p, character(1)))
+
+```
+
+## Comparative Genomics
+
+```{r bgc_matrix, include=FALSE}
+gcf_mat <- t(bigscape_pa)
+gcf_mat <- (gcf_mat > 0) * 1L
+storage.mode(gcf_mat) <- "integer"
+
+gcf_md <- achromo_md[match(colnames(gcf_mat), achromo_md$key), ]
+if (any(is.na(gcf_md$key)))
+  stop("No metadata for strains: ",
+       paste(colnames(gcf_mat)[is.na(gcf_md$key)], collapse = ", "))
+
+gcf_row_order <- order(-rowSums(gcf_mat),
+                       apply(gcf_mat, 1, paste, collapse = ""))
+
+sp_tree <- ape::ladderize(ape::root(
+  ape::read.tree("./derivedData/species_tree/astral.species.tre"),
+  outgroup = "PAO1", resolve.root = TRUE))
+tip_is <- sp_tree$edge[, 2] <= ape::Ntip(sp_tree)
+strain_order <- rev(sp_tree$tip.label[sp_tree$edge[tip_is, 2]])
+strain_order <- strain_order[strain_order != "PAO1"]
+stopifnot(all(strain_order %in% colnames(gcf_mat)))
+COL_ORD <- match(strain_order, colnames(gcf_mat))
+
+clado_tr <- ape::compute.brlen(ape::multi2di(ape::drop.tip(sp_tree, "PAO1")),
+                               method = "Grafen")
+clado_seg <- local({
+  nt <- ape::Ntip(clado_tr)
+  x  <- rep(NA_real_, nt + clado_tr$Nnode)
+  x[seq_len(nt)] <- match(clado_tr$tip.label, strain_order)
+  for (nd in rev(seq(nt + 1, nt + clado_tr$Nnode)))
+    x[nd] <- mean(x[clado_tr$edge[clado_tr$edge[, 1] == nd, 2]])
+  d <- ape::node.depth.edgelength(clado_tr); h <- max(d) - d
+  do.call(rbind, lapply(unique(clado_tr$edge[, 1]), function(nd) {
+    k <- clado_tr$edge[clado_tr$edge[, 1] == nd, 2]
+    rbind(data.frame(x = x[k], y = h[k], xend = x[k], yend = h[nd]),
+          data.frame(x = min(x[k]), y = h[nd], xend = max(x[k]), yend = h[nd]))
+  }))
+})
+
+```
+
+### Alcaligin Pathway Gene Complement
+
+```{r alcaligin_pathway, include=FALSE}
+gene_levels <- c("ArgA", "ArgB", "ArgC", "ArgD1", "ArgD2", "ArgE", "Odc",
+                 "AlcE", "AlcA", "AlcB", "AlcC", "AlcR", "AlcS", "FauA", "AlcD")
+
+group_of <- c(ArgA = "Ornithine", ArgB = "Ornithine", ArgC = "Ornithine",
+              ArgD1 = "Ornithine", ArgD2 = "Ornithine", ArgE = "Ornithine",
+              Odc = "Putrescine",
+              AlcE = "Alcaligin", AlcA = "Alcaligin", AlcB = "Alcaligin",
+              AlcC = "Alcaligin", AlcR = "Regulation",
+              AlcS = "Transport", FauA = "Transport", AlcD = "Reduction")
+
+alcaligin_df <- alcaligin_hits %>%
+  left_join(achromo_md %>% transmute(key, strain = Strain),
+            by = c("genome" = "key")) %>%
+  mutate(gene    = factor(gene, levels = gene_levels),
+         present = as.logical(present),
+         strain  = ifelse(is.na(strain), genome, strain),
+         pathway = factor(group_of[as.character(gene)],
+                          levels = c("Ornithine", "Putrescine", "Alcaligin",
+                                     "Regulation", "Transport", "Reduction")))
+
+key2disp <- alcaligin_df %>% distinct(genome, strain) %>% deframe()
+alcaligin_df$strain <- factor(
+  alcaligin_df$strain,
+  levels = rev(key2disp[strain_order[strain_order %in% alcaligin_df$genome]]))
+
+```
+
+## RNA-seq: Differential Expression
+
+```{r deseq2, include=FALSE}
+ALPHA   <- FDR_CUT
+LFC_CUT <- FC_CUT
+
+rnaseq_out <- "./derivedData/rnaseq"
+res_file <- file.path(rnaseq_out, "deseq2_results_coculture_vs_monoculture.tsv")
+
+if (have_kallisto) {
+  files <- file.path(rnaseq_work, "kallisto", rnaseq_samples$sample,
+                     "abundance.h5")
+  names(files) <- rnaseq_samples$sample
+  missing <- files[!file.exists(files)]
+  if (length(missing))
+    stop("missing kallisto output:\n", paste(missing, collapse = "\n"))
+
+  annot <- read_tsv(file.path(rnaseq_work, "ref", "PAO1_gene_annotation.tsv"),
+                    col_types = cols(start = col_integer(), end = col_integer(),
+                                     length = col_integer(),
+                                     .default = col_character()))
+
+  txi <- tximport(files, type = "kallisto", txOut = TRUE)
+
+  col_data <- as.data.frame(rnaseq_samples)
+  rownames(col_data) <- col_data$sample
+  stopifnot(identical(rownames(col_data), colnames(txi$counts)))
+
+  dds <- DESeqDataSetFromTximport(txi, colData = col_data, design = ~ condition)
+  min_n <- min(table(rnaseq_samples$condition))
+  keep  <- rowSums(counts(dds) >= 10) >= min_n
+  dds <- dds[keep, ]
+  dds <- DESeq(dds)
+
+  res_raw <- results(dds, contrast = c("condition", "coculture", "monoculture"),
+                     alpha = ALPHA)
+  summary(res_raw)
+  res_shr <- lfcShrink(dds, coef = "condition_coculture_vs_monoculture",
+                       type = "apeglm", res = res_raw)
+
+  norm_counts <- counts(dds, normalized = TRUE)
+  mono_cols <- rnaseq_samples$sample[rnaseq_samples$condition == "monoculture"]
+  co_cols   <- rnaseq_samples$sample[rnaseq_samples$condition == "coculture"]
+
+  mle <- rownames_to_column(as.data.frame(res_raw), "target_id") %>%
+    dplyr::select(target_id, log2FoldChange_mle = log2FoldChange,
+                  lfcSE_mle = lfcSE, stat)
+
+  rna_res <- as.data.frame(res_shr) %>%
+    rownames_to_column("target_id") %>%
+    dplyr::rename(log2FoldChange_shrunk = log2FoldChange,
+                  lfcSE_shrunk = lfcSE) %>%
+    left_join(mle, by = "target_id") %>%
+    left_join(annot, by = "target_id") %>%
+    mutate(
+      mean_monoculture = rowMeans(norm_counts[target_id, mono_cols, drop = FALSE]),
+      mean_coculture   = rowMeans(norm_counts[target_id, co_cols,   drop = FALSE]),
+      significant      = !is.na(padj) & padj < ALPHA,
+      direction        = case_when(
+        significant & log2FoldChange_shrunk >=  LFC_CUT ~ "up in coculture",
+        significant & log2FoldChange_shrunk <= -LFC_CUT ~ "up in monoculture",
+        TRUE                                            ~ "not enriched")) %>%
+    dplyr::select(target_id, gene_name, product, feature, pgd_id, replicon,
+                  start, end, strand, length, baseMean, mean_monoculture,
+                  mean_coculture, log2FoldChange_shrunk, lfcSE_shrunk,
+                  log2FoldChange_mle, lfcSE_mle, stat, pvalue, padj,
+                  significant, direction) %>%
+    arrange(padj, desc(abs(log2FoldChange_shrunk)))
+
+  write_tsv(rna_res, res_file)
+
+  vsd <- vst(dds, blind = TRUE)
+  pca <- plotPCA(vsd, intgroup = "condition", returnData = TRUE)
+  write_tsv(rownames_to_column(pca, "sample"),
+            file.path(rnaseq_out, "pca_coordinates.tsv"))
+
+  saveRDS(dds, file.path(rnaseq_work, "dds.rds"))
+} else {
+  rna_res <- read_tsv(res_file, show_col_types = FALSE)
+}
+
+rna_tested <- rna_res %>% filter(!is.na(padj))
+```
+
+## RNA-seq: Gene Sets
+
+```{r gene_sets, include=FALSE}
+CLASSIFIER  <- "PseudoCAP"
+MIN_MEMBERS <- 3
+
+# strip the leading non-breaking space some set names carry
+tidy_name <- function(x) trimws(gsub("[[:space:]]+", " ", gsub(" ", " ", x)))
+
+stopifnot(CLASSIFIER %in% unique(trimws(pao1_pathways$Pathway.Database)))
+
+SET_DROP <- data.frame(
+  set = c(rep("Pyoverdine synthesis", 4), "Pyochelin synthesis"),
+  target_id = c("PA2254", "PA2255", "PA2256", "PA1165", "PA1165"))
+
+SET_REDUNDANT <- c("Other", "isonitrile biosynthesis", "Sulfur metabolism",
+                   "Cysteine metabolism", "Cyanoamino acid metabolism")
+
+gene_sets <- pao1_pathways %>%
+  filter(trimws(Pathway.Database) == CLASSIFIER) %>%
+  transmute(target_id = trimws(Locus.Tag), set = tidy_name(Pathway.Name)) %>%
+  filter(!is.na(set), set != "", target_id %in% rna_tested$target_id) %>%
+  distinct() %>%
+  anti_join(SET_DROP, by = c("set", "target_id")) %>%
+  filter(!set %in% SET_REDUNDANT) %>%
+  mutate(source = CLASSIFIER) %>%
+  group_by(set) %>% filter(n() >= MIN_MEMBERS) %>% ungroup()
+
+curated_sets <- tribble(
+  ~set, ~members,
+  "Outer-membrane TonB-dependent receptors", paste(
+    "PA0151 PA0192 PA0470 PA0931 PA1271 PA1322 PA1365 PA1910 PA1922 PA2057",
+    "PA2335 PA2398 PA2466 PA2688 PA2911 PA3268 PA3408 PA3901 PA4168 PA4221",
+    "PA4514 PA4710 PA4897 PA5505"),
+  "Inner-membrane iron and heme transport", paste(
+    "PA4158 PA4160 PA4161 PA4222 PA4223 PA4358 PA4687 PA4688 PA4705 PA4706",
+    "PA4707 PA4708 PA4709 PA5216"),
+  "TonB-ExbBD energizers", "PA0197 PA0198 PA0199 PA0406 PA0693 PA5531",
+  "Iron-sulfur cluster assembly", "PA3809 PA3810 PA3811 PA3812 PA3813 PA3814 PA3815",
+  "Iron storage", "PA1008 PA3530 PA3531 PA4235 PA4880",
+  "Acetoin and 2,3-butanediol catabolism",
+    "PA4147 PA4148 PA4149 PA4150 PA4151 PA4152 PA4153",
+  # PseudoCAP sulfur/cysteine metabolism minus the isc genes, tested separately
+  "Sulfur amino acid metabolism",
+    "PA5025 PA0399 PA0400 PA3816 PA2709 PA0932 PA0390 PA3107 PA2443 PA5379 PA1795",
+  "Sulfur acquisition and assimilation", paste(
+    "PA0280 PA0281 PA0282 PA0283 PA1493 PA1756 PA1838 PA2594 PA2599",
+    "PA3935 PA3936 PA3937 PA3938 PA4442 PA4443"))
+
+curated_sets <- curated_sets %>%
+  mutate(target_id = str_split(members, "\\s+")) %>%
+  dplyr::select(-members) %>%
+  unnest(target_id) %>%
+  filter(target_id %in% rna_tested$target_id) %>%
+  mutate(source = "Curated") %>%
+  group_by(set) %>% filter(n() >= MIN_MEMBERS) %>% ungroup()
+
+gene_sets <- bind_rows(gene_sets, curated_sets)
+
+rna_tested <- rna_tested %>%
+  mutate(sig  = padj < ALPHA,
+         up   = sig & log2FoldChange_shrunk > 0,
+         down = sig & log2FoldChange_shrunk < 0)
+
+n_up_all   <- sum(rna_tested$up)
+n_down_all <- sum(rna_tested$down)
+
+or_ha <- function(a, b, c, d) ((a + 0.5) * (d + 0.5)) / ((b + 0.5) * (c + 0.5))
+
+set_names <- sort(unique(gene_sets$set))
+geneset_stats <- bind_rows(lapply(set_names, function(s) {
+  loci <- gene_sets$target_id[gene_sets$set == s]
+  idx  <- rna_tested$target_id %in% loci
+  x <- rna_tested$log2FoldChange_shrunk[idx]
+  y <- rna_tested$log2FoldChange_shrunk[!idx]
+
+  a_up <- sum(rna_tested$up[idx]);   b_up <- sum(idx) - a_up
+  c_up <- n_up_all - a_up;           d_up <- sum(!idx) - c_up
+  a_dn <- sum(rna_tested$down[idx]); b_dn <- sum(idx) - a_dn
+  c_dn <- n_down_all - a_dn;         d_dn <- sum(!idx) - c_dn
+
+  data.frame(
+    set = s, source = gene_sets$source[match(s, gene_sets$set)],
+    n_tested = sum(idx),
+    n_sig_up = a_up, n_sig_down = a_dn,
+    median_log2FC = round(median(x), 3), mean_log2FC = round(mean(x), 3),
+    or_up = round(or_ha(a_up, b_up, c_up, d_up), 2),
+    p_up = fisher.test(matrix(c(a_up, b_up, c_up, d_up), 2),
+                       alternative = "greater")$p.value,
+    or_down = round(or_ha(a_dn, b_dn, c_dn, d_dn), 2),
+    p_down = fisher.test(matrix(c(a_dn, b_dn, c_dn, d_dn), 2),
+                         alternative = "greater")$p.value,
+    p_shift = suppressWarnings(wilcox.test(x, y))$p.value)
+})) %>%
+  mutate(padj_up    = p.adjust(p_up, "BH"),
+         padj_down  = p.adjust(p_down, "BH"),
+         padj_shift = p.adjust(p_shift, "BH"),
+         across(c(p_up, p_down, p_shift, padj_up, padj_down, padj_shift),
+                ~signif(.x, 3))) %>%
+  arrange(desc(median_log2FC))
+
+geneset_members <- gene_sets %>%
+  left_join(dplyr::select(rna_tested, target_id, gene_name, product, baseMean,
+                          mean_monoculture, mean_coculture,
+                          log2FoldChange_shrunk, padj, direction),
+            by = "target_id") %>%
+  arrange(set, desc(log2FoldChange_shrunk))
+```
+
+### Iron and Virulence Categories
+
+```{r rna_categories, include=FALSE}
+SECMET_VF <- c("Phenazine biosynthesis", "Rhamnolipid biosynthesis",
+               "Hydrogen cyanide production")
+SECMET_PW <- c("Phenazine biosynthesis")
+# H1-T6SS and flagella are not host-directed virulence; same cut in Fig 8
+T6SS_VF   <- c("Hcp secretion island-1 encoded type VI secretion system (H-T6SS)",
+               "Flagella")
+IRON_VF   <- c("Pyoverdine", "Pyochelin", "Pyochelin receptor")
+IRON_PW   <- c("Pyoverdine synthesis", "Pyochelin synthesis")
+IRON_GENE <- paste0("^(pvd|fpv|pvc|pch|fpt|has[AR]|phu|hxu|feo|fec|fox|fiu|fem|",
+                    "hit|pfe|tonB|exb|fur|bfr|ftn)")
+IRON_DESC <- paste0("pyoverdin|pyochelin|ferripyoverdine|ferripyochelin|siderophore|",
+                    "heme acquisition|heme/hemoglobin|heme-transport|heme uptake|",
+                    "hemoglobin uptake|ferric|ferrous|iron uptake|iron transport|",
+                    "iron-regulated|tonb-dependent|bacterioferritin|ferritin|",
+                    "ferric uptake regul")
+
+vf <- pao1_vf %>%
+  filter(toupper(trimws(Source)) == "VFDB") %>%
+  transmute(target_id = trimws(Locus.Tag),
+            vfcat = trimws(Virulence.Category)) %>%
+  filter(target_id != "") %>%
+  group_by(target_id) %>% slice_head(n = 1) %>% ungroup()
+
+pw_cls <- pao1_pathways %>%
+  filter(trimws(Pathway.Database) == CLASSIFIER) %>%
+  transmute(target_id = trimws(Locus.Tag), pathway = trimws(Pathway.Name))
+iron_pw_loci   <- unique(pw_cls$target_id[pw_cls$pathway %in% IRON_PW])
+secmet_pw_loci <- unique(pw_cls$target_id[pw_cls$pathway %in% SECMET_PW])
+
+rna_dat <- rna_tested %>%
+  left_join(vf, by = "target_id") %>%
+  mutate(
+    gene_nm = ifelse(is.na(gene_name), "", gene_name),
+    prod_nm = ifelse(is.na(product), "", product),
+    iron_hit = grepl(IRON_GENE, gene_nm, ignore.case = TRUE) |
+               grepl(IRON_DESC, prod_nm, ignore.case = TRUE),
+    highlight = case_when(
+      iron_hit | vfcat %in% IRON_VF | target_id %in% iron_pw_loci ~ "Iron",
+      vfcat %in% SECMET_VF | target_id %in% secmet_pw_loci        ~ "Not highlighted",
+      vfcat %in% T6SS_VF                                          ~ "Not highlighted",
+      !is.na(vfcat)                                               ~ "Virulence",
+      TRUE                                                        ~ "Not highlighted"),
+    highlight = case_when(target_id == "PA0707"                 ~ "Virulence",
+                          gene_nm %in% c("paaP", "plcB")        ~ "Virulence",
+                          TRUE ~ highlight),
+    highlight = factor(highlight, levels = c("Iron", "Virulence",
+                                             "Not highlighted")),
+    significant = padj < FDR_CUT & abs(log2FoldChange_shrunk) >= FC_CUT,
+    neg_log10_q = -log10(padj),
+    log10_expr  = log10(baseMean + 1))
+
+```
+
+```{r rna_category_stats, include=FALSE}
+set_report <- function(idx, name) {
+  x <- rna_dat$log2FoldChange_shrunk[idx]
+  y <- rna_dat$log2FoldChange_shrunk[!idx]
+  sig_up <- sum(rna_dat$padj[idx] < FDR_CUT & x > 0)
+  sig_dn <- sum(rna_dat$padj[idx] < FDR_CUT & x < 0)
+  up_out <- sum(rna_dat$padj[!idx] < FDR_CUT & y > 0)
+  ft <- fisher.test(matrix(c(sig_up, sum(idx) - sig_up,
+                             up_out, sum(!idx) - up_out), 2),
+                    alternative = "greater")
+  data.frame(set = name, n_tested = sum(idx), n_sig_up = sig_up,
+             n_sig_down = sig_dn,
+             n_past_both_cutoffs = sum(rna_dat$significant[idx]),
+             pct_sig_up = round(100 * sig_up / sum(idx), 1),
+             median_log2FC = round(median(x), 3),
+             fisher_odds = round(unname(ft$estimate), 2),
+             fisher_p = signif(ft$p.value, 3),
+             ranksum_p = signif(suppressWarnings(
+               wilcox.test(x, y, alternative = "greater"))$p.value, 3),
+             signedrank_p = signif(suppressWarnings(
+               wilcox.test(x, mu = 0, alternative = "greater"))$p.value, 3))
+}
+
+is_secmet <- (rna_dat$vfcat %in% SECMET_VF |
+                rna_dat$target_id %in% secmet_pw_loci) &
+  rna_dat$highlight == "Not highlighted"
+
+rna_cat_stats <- bind_rows(
+  set_report(rna_dat$highlight == "Iron", "Iron"),
+  set_report(rna_dat$highlight == "Virulence", "Virulence"),
+  set_report(ifelse(is.na(is_secmet), FALSE, is_secmet),
+             "Secondary Metabolism (not plotted)"),
+  set_report(rna_dat$target_id %in% vf$target_id[vf$vfcat == "Pyoverdine"],
+             "  Pyoverdine (VFDB)"),
+  set_report(rna_dat$target_id %in% vf$target_id[vf$vfcat == "Pyochelin"],
+             "  Pyochelin (VFDB)"))
+
+```
+
+## RNA-seq: Pathway Over-Representation
+
+```{r pathway_ora, include=FALSE}
+P_SHOW  <- 0.05
+Q_SOLID <- 0.05
+
+ora_up <- geneset_stats %>%
+  filter(p_up < P_SHOW, n_sig_up > 0) %>%
+  transmute(set, source, n_tested, direction = "Enriched in Coculture",
+            n_sig = n_sig_up, odds_ratio = or_up, p = p_up, padj = padj_up)
+ora_dn <- geneset_stats %>%
+  filter(p_down < P_SHOW, n_sig_down > 0) %>%
+  transmute(set, source, n_tested, direction = "Enriched in Monoculture",
+            n_sig = n_sig_down, odds_ratio = or_down, p = p_down, padj = padj_down)
+
+rna_ora <- bind_rows(ora_up, ora_dn) %>%
+  group_by(set) %>% slice_min(p, n = 1, with_ties = FALSE) %>% ungroup() %>%
+  filter(padj < Q_SOLID) %>%
+  mutate(frac_enriched = n_sig / n_tested,
+         direction = factor(direction, levels = c("Enriched in Coculture",
+                                                  "Enriched in Monoculture")),
+         signed_lor = ifelse(direction == "Enriched in Coculture",
+                             log2(odds_ratio), -log2(odds_ratio)),
+         neglog10q = -log10(padj),
+         label = str_wrap(title_case(recode(set,
+           "Pyoverdine synthesis" = "Pyoverdine biosynthesis",
+           "Pyochelin synthesis"  = "Pyochelin biosynthesis",
+           # formate dehydrogenase, catalase and SHMT; no methane metabolism here
+           "Methane metabolism"   = "Formate and one-carbon metabolism",
+           # liuA-D, the leucine/isovalerate operon
+           "Acyclic isoprenoid catabolism" = "Isovalerate utilization")),
+           30)) %>%
+  arrange(signed_lor) %>%
+  mutate(term = factor(label, levels = label))
+
+```
+
+## RNA-seq: Replicate Quality Control
+
+```{r replicate_qc, include=FALSE}
+if (have_dds) {
+  dds_qc <- readRDS(file.path(rnaseq_work, "dds.rds"))
+  qc_samples <- colnames(dds_qc)
+  qc_cond <- setNames(as.character(colData(dds_qc)$condition), qc_samples)
+
+  vsd_qc <- vst(dds_qc, blind = TRUE)
+  V <- assay(vsd_qc)
+  raw_counts <- counts(dds_qc)
+
+  qc <- data.frame(sample = qc_samples, condition = qc_cond[qc_samples],
+                   assigned_counts = colSums(raw_counts),
+                   genes_detected = colSums(raw_counts > 0),
+                   median_vst = apply(V, 2, median))
+
+  C <- cor(V, method = "pearson"); diag(C) <- NA
+  qc$median_cor <- apply(C, 2, median, na.rm = TRUE)
+  cor_cut <- mean(qc$median_cor) - 3 * sd(qc$median_cor)
+
+  rle_mat <- V - rowMedians(V)
+  rle_long <- as.data.frame(rle_mat) %>%
+    mutate(gene = rownames(rle_mat)) %>%
+    pivot_longer(all_of(qc_samples), names_to = "sample", values_to = "rle") %>%
+    mutate(condition = qc_cond[sample],
+           sample = factor(sample, levels = qc_samples))
+  qc$median_rle <- apply(rle_mat, 2, median)
+  qc$iqr_rle    <- apply(rle_mat, 2, IQR)
+
+  cooks <- log10(assays(dds_qc)[["cooks"]])
+  cook_long <- as.data.frame(cooks) %>%
+    mutate(gene = rownames(cooks)) %>%
+    pivot_longer(all_of(qc_samples), names_to = "sample", values_to = "cook") %>%
+    filter(is.finite(cook)) %>%
+    mutate(condition = qc_cond[sample],
+           sample = factor(sample, levels = qc_samples))
+  qc$median_log10_cooks <- apply(cooks, 2, median, na.rm = TRUE)
+  cook_cut <- mean(qc$median_log10_cooks) + 3 * sd(qc$median_log10_cooks)
+
+  qc <- qc %>%
+    mutate(flag_correlation = median_cor < cor_cut,
+           flag_rle         = abs(median_rle) > 0.1,
+           flag_cooks       = median_log10_cooks > cook_cut,
+           outlier          = flag_correlation | flag_rle | flag_cooks)
+
+  write_tsv(qc, file.path(rnaseq_out, "replicate_qc.tsv"))
+
+  qc_cor_long <- as.data.frame(as.table(cor(V))) %>%
+    dplyr::rename(s1 = Var1, s2 = Var2, r = Freq) %>%
+    mutate(s1 = factor(s1, levels = qc_samples),
+           s2 = factor(s2, levels = rev(qc_samples)))
+  qc_pca <- plotPCA(vsd_qc, intgroup = "condition", returnData = TRUE)
+  qc_pv  <- round(100 * attr(qc_pca, "percentVar"))
+} else {
+  qc <- read_tsv(file.path(rnaseq_out, "replicate_qc.tsv"), show_col_types = FALSE)
+  rle_long <- cook_long <- qc_cor_long <- NULL
+  qc_pca <- read_tsv(file.path(rnaseq_out, "pca_coordinates.tsv"),
+                     show_col_types = FALSE)
+  qc_pv <- NULL
+}
+```
+
+## RNA-seq: Fur Boxes
+
+```{r fur_sites, include=FALSE}
+UPSTREAM <- 300
+
+SCAN <- "fimo_pa_"
+
+LAB <- c(repressed  = "Enriched in\nMonoculture",
+         background = "Not\nEnriched",
+         induced    = "Enriched in\nCoculture")
+COL <- c(induced = unname(HL_COLS["Iron"]), repressed = "#4b86b8",
+         background = "gray70")
+
+motif_dir <- file.path(rnaseq_work, "motifs")
+
+if (have_motifs) {
+  read_fimo <- function(set) {
+    d <- read_tsv(file.path(motif_dir, paste0(SCAN, set, ".txt")), comment = "#",
+                  show_col_types = FALSE, progress = FALSE)
+    names(d) <- make.names(names(d))
+    d %>% filter(!is.na(score)) %>% mutate(set = set)
+  }
+  n_promoters <- function(set)
+    sum(startsWith(readLines(file.path(motif_dir, paste0("promoters_", set, ".fa"))), ">"))
+
+  fimo <- bind_rows(lapply(names(LAB), read_fimo))
+  fur_totals <- vapply(names(LAB), n_promoters, numeric(1))
+
+  # FIMO reports a site on both strands; keep the better and merge overlaps
+  fur_sites <- fimo %>%
+    mutate(center = (start + stop) / 2 - (UPSTREAM + 1),
+           bin = round(center / 10)) %>%
+    group_by(set, sequence_name, bin) %>%
+    slice_max(score, n = 1, with_ties = FALSE) %>%
+    ungroup() %>%
+    separate(sequence_name, c("target_id", "gene"), sep = "\\|", remove = FALSE)
+  write_tsv(fur_sites, file.path(rnaseq_out, "fur_box_sites.tsv"))
+} else {
+  fur_sites <- read_tsv(file.path(rnaseq_out, "fur_box_sites.tsv"),
+                        show_col_types = FALSE)
+  fur_totals <- read_tsv(file.path(rnaseq_out, "fur_box_proportions.tsv"),
+                         show_col_types = FALSE) %>%
+    dplyr::select(set, n) %>% deframe()
+  fur_totals <- fur_totals[names(LAB)]
+}
+
+fur_hit <- fur_sites %>% group_by(set) %>%
+  summarize(k = n_distinct(target_id), .groups = "drop")
+```
+
+### Replicate Jackknife
+
+```{r fur_jackknife, include=FALSE}
+jk_file <- file.path(rnaseq_out, "fur_box_jackknife.tsv")
+
+if (have_dds && have_motifs) {
+  leaders <- unlist(lapply(names(LAB), function(s) {
+    h <- grep("^>", readLines(file.path(motif_dir, paste0("promoters_", s, ".fa"))),
+              value = TRUE)
+    sub("\\|.*$", "", sub("^>", "", h))
+  }))
+  has_box <- unique(unlist(lapply(names(LAB), function(s) {
+    d <- read.delim(file.path(motif_dir, paste0(SCAN, s, ".txt")),
+                    comment.char = "#")
+    sub("\\|.*$", "", d$sequence_name[!is.na(d$score)])
+  })))
+
+  dds_jk <- readRDS(file.path(rnaseq_work, "dds.rds"))
+
+  classify <- function(r) {
+    r <- as.data.frame(r); r$target_id <- rownames(r)
+    r <- r[r$target_id %in% leaders & !is.na(r$padj), ]
+    grp <- ifelse(r$padj >= ALPHA, "background",
+                  ifelse(r$log2FoldChange > 0, "induced", "repressed"))
+    tapply(r$target_id, grp,
+           function(ids) c(k = sum(ids %in% has_box), n = length(ids)))
+  }
+  tally <- function(r, label) {
+    cl <- classify(r)
+    bind_rows(lapply(names(cl), function(g)
+      data.frame(run = label, set = g, k = cl[[g]]["k"], n = cl[[g]]["n"],
+                 pct = 100 * cl[[g]]["k"] / cl[[g]]["n"])))
+  }
+
+  full_tally <- tally(lfcShrink(dds_jk, coef = "condition_coculture_vs_monoculture",
+                                type = "apeglm", quiet = TRUE), "full")
+  loo_runs <- lapply(colnames(dds_jk), function(s) {
+    d <- dds_jk[, colnames(dds_jk) != s]
+    d$condition <- droplevels(d$condition)
+    d <- DESeq(d, quiet = TRUE)
+    r <- lfcShrink(d, coef = "condition_coculture_vs_monoculture",
+                   type = "apeglm", quiet = TRUE)
+    tally(r, s)
+  })
+
+  jk <- bind_rows(c(list(full_tally), loo_runs)) %>%
+    mutate(set = factor(set, levels = names(LAB)))
+  write_tsv(jk, jk_file)
+
+  jk_summary <- jk %>% filter(run != "full") %>% group_by(set) %>%
+    summarize(n_runs = n(), mean_pct = mean(pct),
+              min_pct = min(pct), max_pct = max(pct),
+              # leave-one-out SE: the (n-1)/n factor, not a bootstrap SD
+              jack_se = sqrt((n() - 1) / n() * sum((pct - mean(pct))^2)),
+              .groups = "drop") %>%
+    left_join(full_tally %>% dplyr::select(set, pct_full = pct, k_full = k,
+                                           n_full = n), by = "set") %>%
+    mutate(lo = pmax(0, pct_full - 1.96 * jack_se),
+           hi = pct_full + 1.96 * jack_se)
+} else {
+  jk <- read_tsv(jk_file, show_col_types = FALSE) %>%
+    mutate(set = factor(set, levels = names(LAB)))
+}
+
+jk_loo <- jk %>% filter(run != "full")
+```
+
+### Motif Enrichment
+
+```{r fur_proportions, include=FALSE}
+wilson <- function(k, n, z = 1.96) {
+  p <- k / n; d <- 1 + z^2 / n
+  c((p + z^2 / (2 * n) - z * sqrt(p * (1 - p) / n + z^2 / (4 * n^2))) / d,
+    (p + z^2 / (2 * n) + z * sqrt(p * (1 - p) / n + z^2 / (4 * n^2))) / d)
+}
+
+fur_prop <- tibble(set = names(LAB), n = as.numeric(fur_totals[names(LAB)]),
+                   k = fur_hit$k[match(names(LAB), fur_hit$set)]) %>%
+  mutate(k = ifelse(is.na(k), 0, k), pct = 100 * k / n,
+         wilson_lo = 100 * mapply(function(a, b) wilson(a, b)[1], k, n),
+         wilson_hi = 100 * mapply(function(a, b) wilson(a, b)[2], k, n))
+
+jk_rng <- jk_loo %>% group_by(set) %>%
+  summarize(lo = min(pct), hi = max(pct), n_runs = n(), .groups = "drop")
+fur_prop <- fur_prop %>% left_join(jk_rng, by = "set")
+
+fur_pairs <- combn(names(LAB), 2, simplify = FALSE)
+fur_tests <- bind_rows(lapply(fur_pairs, function(pr) {
+  a <- fur_prop[fur_prop$set == pr[1], ]; b <- fur_prop[fur_prop$set == pr[2], ]
+  ft <- fisher.test(matrix(c(a$k, a$n - a$k, b$k, b$n - b$k), nrow = 2))
+  data.frame(comparison = paste(pr, collapse = " vs "),
+             pct_1 = round(100 * a$k / a$n, 2), pct_2 = round(100 * b$k / b$n, 2),
+             odds_ratio = round(unname(ft$estimate), 3), p = ft$p.value)
+})) %>% mutate(padj = p.adjust(p, "BH"))
+
+cld_p <- setNames(fur_tests$padj, gsub(" vs ", "-", fur_tests$comparison))
+fur_cld <- multcompLetters(cld_p, threshold = 0.05)$Letters
+fur_prop$letter <- unname(fur_cld[fur_prop$set])
+
+fur_bg  <- fur_prop[fur_prop$set == "background", ]
+fur_ind <- fur_prop[fur_prop$set == "induced", ]
+fur_one_sided <- fisher.test(
+  matrix(c(fur_ind$k, fur_ind$n - fur_ind$k,
+           fur_bg$k,  fur_bg$n  - fur_bg$k), nrow = 2), alternative = "greater")
+
+write_tsv(fur_prop, file.path(rnaseq_out, "fur_box_proportions.tsv"))
+fur_found <- fur_sites %>%
+  left_join(dplyr::select(rna_res, target_id, product, log2FoldChange_shrunk,
+                          padj), by = "target_id") %>%
+  transmute(target_id, gene, product, set, position = round(center), strand,
+            match_score = score, match_p = p.value, matched_sequence,
+            log2FoldChange_shrunk, padj) %>%
+  arrange(desc(match_score))
+```
+
+### The Published Fur Regulon
+
+```{r fur_collectf, include=FALSE}
+# PA#### tags are sequential, so a range expands by number
+expand_tags <- function(s) {
+  parts <- unlist(strsplit(s, "[/;]"))
+  unlist(lapply(trimws(parts), function(p) {
+    if (grepl("^PA[0-9.]+-PA[0-9.]+$", p)) {
+      ab <- as.numeric(sub("^PA", "", unlist(strsplit(p, "-"))))
+      sprintf("PA%04d", seq(floor(ab[1]), floor(ab[2])))
+    } else if (grepl("^PA[0-9.]+$", p)) p else character(0)
+  }))
+}
+
+ct_targets <- bind_rows(lapply(seq_len(nrow(fur_collectf)), function(i) {
+  tags <- expand_tags(fur_collectf$target_locus_tags[i])
+  if (!length(tags)) return(NULL)
+  data.frame(tier = fur_collectf$tier[i], site = fur_collectf$sequence[i],
+             operon = fur_collectf$target_locus_tags[i],
+             gene_names = fur_collectf$target_gene_names[i],
+             pmid = fur_collectf$pmid[i], target_id = tags)
+})) %>% distinct(target_id, .keep_all = TRUE)
+
+fur_targets <- ct_targets %>%
+  left_join(dplyr::select(rna_res, target_id, gene_name, product, baseMean,
+                          log2FoldChange_shrunk, padj), by = "target_id") %>%
+  mutate(tested = !is.na(padj),
+         call = case_when(!tested ~ "not tested",
+                          padj >= ALPHA ~ "not significant",
+                          log2FoldChange_shrunk > 0 ~ "enriched in coculture",
+                          TRUE ~ "enriched in monoculture"))
+
+if (have_motifs) {
+  scanned <- unlist(lapply(names(LAB), function(s) {
+    h <- grep("^>", readLines(file.path(motif_dir, paste0("promoters_", s, ".fa"))),
+              value = TRUE)
+    sub("\\|.*$", "", sub("^>", "", h))
+  }))
+  found <- unique(sub("\\|.*$", "", fur_sites$sequence_name))
+  fur_targets <- fur_targets %>%
+    mutate(is_operon_leader = target_id %in% scanned,
+           scan_found_site  = target_id %in% found)
+}
+MAXDIST <- 500
+
+if (have_kallisto || file.exists(file.path(rnaseq_work, "ref",
+                                           "PAO1_gene_annotation.tsv"))) {
+  ann <- read_tsv(file.path(rnaseq_work, "ref", "PAO1_gene_annotation.tsv"),
+                  show_col_types = FALSE)
+} else {
+  ann <- rna_res %>% dplyr::select(target_id, start, end, strand)
+}
+
+nearest_downstream <- function(mid) {
+  if (is.na(mid)) return(data.frame(target_id = NA_character_,
+                                    distance = NA_real_))
+  d <- ifelse(ann$strand == "+", ann$start - mid, mid - ann$end)
+  ok <- which(d > 0 & d <= MAXDIST)
+  if (!length(ok)) return(data.frame(target_id = NA_character_,
+                                     distance = NA_real_))
+  i <- ok[which.min(d[ok])]
+  data.frame(target_id = ann$target_id[i], distance = d[i])
+}
+
+ct_sites <- fur_collectf %>%
+  mutate(mid = (start + end) / 2) %>%
+  distinct(sequence, mid, target_locus_tags, target_gene_names, tier,
+           .keep_all = TRUE)
+assigned <- bind_rows(lapply(ct_sites$mid, nearest_downstream))
+ct_sites <- bind_cols(dplyr::select(ct_sites, tier, sequence, strand, mid,
+                                    operon = target_locus_tags,
+                                    gene_names = target_gene_names), assigned)
+
+fallback <- vapply(ct_sites$operon, function(s) {
+  t <- expand_tags(s); if (length(t)) t[1] else NA_character_
+}, character(1), USE.NAMES = FALSE)
+
+ct_sites <- ct_sites %>%
+  mutate(placed_by = ifelse(!is.na(target_id), "nearest downstream gene",
+                            ifelse(is.na(fallback), "unplaced",
+                                   "CollecTF locus tag")),
+         target_id = ifelse(is.na(target_id), fallback, target_id)) %>%
+  left_join(dplyr::select(rna_res, target_id, gene_name, product,
+                          log2FoldChange_shrunk, padj), by = "target_id") %>%
+  mutate(promoter = ifelse(is.na(gene_name) | gene_name == "", target_id,
+                           gene_name))
+
+n_tested_ct <- sum(fur_targets$tested)
+n_up_ct <- sum(fur_targets$call == "enriched in coculture")
+bg_up <- sum(rna_res$padj < ALPHA & rna_res$log2FoldChange_shrunk > 0,
+             na.rm = TRUE)
+bg_n  <- sum(!is.na(rna_res$padj))
+ct_fisher <- fisher.test(matrix(c(n_up_ct, n_tested_ct - n_up_ct,
+                                  bg_up - n_up_ct,
+                                  bg_n - n_tested_ct - (bg_up - n_up_ct)), 2),
+                         alternative = "greater")
+```
+
+### The Pooled Fur Regulon
+
+```{r fur_regulon, include=FALSE}
+ct_placed <- ct_sites %>% filter(placed_by != "unplaced") %>%
+  distinct(promoter, .keep_all = TRUE)
+
+ev <- fur_collectf %>%
+  group_by(sequence) %>%
+  summarize(evidence = paste(unique(evidence), collapse = "; "),
+            pmid = paste(unique(pmid), collapse = "; "), .groups = "drop")
+
+val <- ct_placed %>%
+  left_join(ev, by = "sequence") %>%
+  transmute(target_id, promoter_gene = promoter, site = toupper(sequence),
+            source = "Validated", evidence, pmid, tier,
+            genome_position = ifelse(is.na(mid), NA_real_, round(mid)),
+            site_strand = strand, distance, placed_by,
+            fimo_score = NA_real_, fimo_p = NA_real_)
+pred <- fur_found %>%
+  group_by(target_id) %>% slice_min(match_p, n = 1, with_ties = FALSE) %>%
+  ungroup() %>%
+  transmute(target_id, promoter_gene = gene, site = toupper(matched_sequence),
+            source = "Predicted", evidence = NA_character_, pmid = NA_character_,
+            tier = NA_integer_, genome_position = NA_real_, site_strand = strand,
+            distance = -position, placed_by = "promoter the site was found in",
+            fimo_score = match_score, fimo_p = match_p)
+
+first_ok <- function(x) if (all(is.na(x))) x[1] else x[!is.na(x)][1]
+fur_fbs <- bind_rows(val, pred) %>%
+  group_by(target_id) %>%
+  summarize(across(c(promoter_gene, site, evidence, pmid, tier, genome_position,
+                     site_strand, distance, placed_by, fimo_score, fimo_p),
+                   first_ok),
+            source = if (n() > 1) "Both" else first(source), .groups = "drop") %>%
+  left_join(dplyr::select(rna_res, target_id, product, log2FoldChange_shrunk,
+                          padj), by = "target_id") %>%
+  arrange(desc(log2FoldChange_shrunk))
+
+stopifnot(all(nchar(fur_fbs$site) == 19))
+
+# the reciprocal test: of the genes with a Fur box, how many went up
+fbs_dat <- rna_tested %>%
+  mutate(fbs  = target_id %in% fur_fbs$target_id,
+         grp  = factor(ifelse(fbs, "Fur Box", "No Fur Box"),
+                       levels = c("Fur Box", "No Fur Box")),
+         up   = padj < ALPHA & log2FoldChange_shrunk > 0,
+         down = padj < ALPHA & log2FoldChange_shrunk < 0)
+
+fbs_tab <- fbs_dat %>% group_by(grp) %>%
+  summarize(n = n(), n_up = sum(up), n_down = sum(down),
+            pct_up = 100 * mean(up), median_lfc = median(log2FoldChange_shrunk),
+            .groups = "drop")
+fbs_fisher <- fisher.test(matrix(c(fbs_tab$n_up, fbs_tab$n - fbs_tab$n_up),
+                                 nrow = 2), alternative = "greater")
+fbs_shift <- wilcox.test(log2FoldChange_shrunk ~ grp, data = fbs_dat,
+                         alternative = "greater")
+
+# Fur represses the transcription unit, so operon members count as targets
+MIN_GAP <- 100
+ap <- rna_res %>% dplyr::select(target_id, start, end, strand) %>% arrange(start)
+prev_end  <- c(0, cummax(ap$end)[-nrow(ap)])
+nxt_i     <- findInterval(ap$end, ap$start) + 1L
+nxt_start <- ifelse(nxt_i <= nrow(ap), ap$start[pmin(nxt_i, nrow(ap))], Inf)
+ap$starts_unit <- ifelse(ap$strand == "+", ap$start - prev_end,
+                         nxt_start - ap$end) >= MIN_GAP
+
+assign_units <- function(idx) {           # idx given in transcription order
+  cur <- NA_character_; out <- character(length(idx))
+  for (k in seq_along(idx)) {
+    if (ap$starts_unit[idx[k]]) cur <- ap$target_id[idx[k]]
+    out[k] <- cur
+  }
+  out
+}
+ap$unit <- NA_character_
+ip <- which(ap$strand == "+");      ap$unit[ip] <- assign_units(ip)
+im <- rev(which(ap$strand == "-")); ap$unit[im] <- assign_units(im)
+
+fbs_dat <- fbs_dat %>%
+  mutate(in_unit = target_id %in% ap$target_id[ap$unit %in% fur_fbs$target_id])
+unit_fisher <- fisher.test(with(fbs_dat, matrix(
+  c(sum(up & in_unit), sum(up & !in_unit),
+    sum(!up & in_unit), sum(!up & !in_unit)), nrow = 2)),
+  alternative = "greater")
+```
+
+## Proteomics
+
+```{r proteomics, include=FALSE}
+prot_dat <- prot_volcano %>%
+  mutate(across(c(significant, do_label, secreted), as.logical),
+         highlight = factor(highlight,
+                            levels = c("Iron", "Secondary Metabolism",
+                                       "Virulence", "Not highlighted")),
+         label_disp = paste0(toupper(substr(label, 1, 1)),
+                             substr(label, 2, nchar(label))))
+```
+
+## Supplemental Tables
+
+```{r supplemental_tables, include=FALSE}
+sup_dir <- "./tables"
+dir.create(sup_dir, showWarnings = FALSE)
+rnd <- function(x, n = 3) round(x, n)
+
+fc_signed <- function(l2, n = 2)
+  round(ifelse(l2 >= 0, 2^l2, -1 / 2^l2), n)
+
+# ---- S1: amplicon sample metadata ----
+s1 <- cf_metadata %>% dplyr::rename(Group = fig1_group)
+
+# ---- S3: differential expression ----
+s3 <- rna_res %>%
+  transmute(`Locus Tag` = target_id, `Gene Name` = gene_name,
+            `Product` = product, `Feature` = feature, `Replicon` = replicon,
+            `Start` = start, `End` = end, `Strand` = strand,
+            `Length (bp)` = length,
+            `Base Mean` = rnd(baseMean, 1),
+            `Mean Monoculture` = rnd(mean_monoculture, 1),
+            `Mean Coculture` = rnd(mean_coculture, 1),
+            `Fold Change (Coculture/Monoculture)` =
+              fc_signed(log2FoldChange_shrunk),
+            `log2 Fold Change` = rnd(log2FoldChange_shrunk),
+            `log2 Fold Change SE` = rnd(lfcSE_shrunk),
+            `log2 Fold Change (Unshrunk)` = rnd(log2FoldChange_mle),
+            # left unrounded so a reader can sort on them
+            `P-Value` = pvalue, `BH-Adjusted P-Value` = padj) %>%
+  arrange(`BH-Adjusted P-Value`, desc(abs(`log2 Fold Change`)))
+
+# ---- S4: Fur boxes ----
+s4 <- fur_fbs %>%
+  transmute(`Promoter Locus Tag` = target_id, `Promoter Gene` = promoter_gene,
+            `Product` = product, `Fur Box Sequence` = site,
+            `Source` = recode(source,
+                              Validated = "Validated (CollecTF)",
+                              Predicted = "Predicted (FIMO)",
+                              Both = "Validated and predicted"),
+            `Evidence` = evidence, `PMID` = pmid,
+            `CollecTF Confidence Tier` = tier,
+            `Genome Position` = genome_position, `Site Strand` = site_strand,
+            `Distance to Start Codon (bp)` = distance,
+            `Promoter Assignment` = placed_by,
+            `FIMO Score` = rnd(fimo_score, 2), `FIMO P-Value` = fimo_p,
+            `Gene Fold Change (Coculture/Monoculture)` =
+              fc_signed(log2FoldChange_shrunk),
+            `Gene log2 Fold Change` = rnd(log2FoldChange_shrunk),
+            `Gene BH-Adjusted P-Value` = padj) %>%
+  arrange(desc(`Gene log2 Fold Change`))
+
+walk2(list(s1, s3, s4),
+      c("Table_S1.tsv", "Table_S3.tsv", "Table_S4.tsv"),
+      ~safe_write_tsv(.x, file.path(sup_dir, .y), na = ""))
+```
+
+### S5: Iron-Related Genes and Their Cofactors
+
+```{r table_s5, include=FALSE}
+iron_cofactor <- tribble(
+  ~target_id, ~cofactor, ~class, ~basis,
+  # respiratory chain
+  "PA4429", "Heme c", "Respiratory chain", "Cytochrome c1 of the bc1 complex",
+  "PA4430", "Heme b", "Respiratory chain", "Cytochrome b of the bc1 complex",
+  "PA4431", "[2Fe-2S] Rieske", "Respiratory chain", "Rieske protein of the bc1 complex",
+  # central carbon
+  "PA1562", "[4Fe-4S]", "Central carbon", "Aconitase catalytic cluster",
+  "PA4470", "None", "Central carbon", "Class II fumarase, iron-free isozyme of the [4Fe-4S] class I enzyme",
+  "PA3452", "None (FAD)", "Central carbon", "Malate:quinone oxidoreductase, bypasses complex I",
+  "PA5353", "[Fe-S] clusters", "Central carbon", "Glycolate oxidase iron-sulfur subunit",
+  # formate oxidation and the molybdenum cofactor
+  "PA4812", "[4Fe-4S] and Mo-bisMGD", "Formate oxidation", "Formate dehydrogenase catalytic subunit",
+  "PA4811", "[4Fe-4S]", "Formate oxidation", "Formate dehydrogenase electron-transfer subunit",
+  "PA4810", "Heme b", "Formate oxidation", "Formate dehydrogenase cytochrome b subunit",
+  "PA3870", "Two [4Fe-4S]", "Molybdenum cofactor", "Radical-SAM MoaA",
+  "PA1505", "Two [4Fe-4S]", "Molybdenum cofactor", "Radical-SAM MoaA paralog",
+  "PA3915", "None", "Molybdenum cofactor", "MoaB, no iron center",
+  # oxidative stress and nitrogen
+  "PA4236", "Heme b", "Oxidative stress", "Catalase KatA",
+  "PA4130", "Siroheme and [4Fe-4S]", "Nitrogen", "Ferredoxin-dependent nitrite reductase",
+  "PA1174", "Mo-bisMGD and [4Fe-4S]", "Nitrogen", "Periplasmic nitrate reductase",
+  "PA0509", "Heme d1 maturation", "Nitrogen", "NirN",
+  "PA0527", "Heme", "Nitrogen", "Dnr, heme-based nitric oxide sensor",
+  # sulfur
+  "PA1838", "Siroheme and [4Fe-4S]", "Sulfur assimilation", "Sulfite reductase haemoprotein",
+  "PA3935", "Mononuclear Fe(II)", "Sulfur scavenging", "Taurine dioxygenase, Fe(II) and 2-oxoglutarate dependent",
+  # iron-sulfur cluster assembly
+  "PA3815", "[2Fe-2S] sensor", "Fe-S cluster assembly", "IscR, cluster-sensing regulator",
+  "PA3814", "None (PLP)", "Fe-S cluster assembly", "IscS cysteine desulfurase, sulfur donor",
+  "PA3813", "Transient [2Fe-2S]", "Fe-S cluster assembly", "IscU scaffold",
+  "PA3812", "[Fe-S] carrier", "Fe-S cluster assembly", "IscA",
+  "PA3811", "None", "Fe-S cluster assembly", "HscB co-chaperone",
+  "PA3810", "None", "Fe-S cluster assembly", "HscA chaperone",
+  # storage
+  "PA4235", "Ferric mineral core", "Iron storage", "Bacterial ferritin",
+  "PA4880", "Heme b and ferric core", "Iron storage", "Probable bacterioferritin",
+  "PA3531", "Heme b and ferric core", "Iron storage", "Bacterioferritin BfrB",
+  "PA3530", "[2Fe-2S]", "Iron storage", "Bfd, bacterioferritin-associated ferredoxin")
+
+RECEPTOR <- c("PA0151","PA0192","PA0470","PA0931","PA1271","PA1302","PA1322",
+              "PA1365","PA1910","PA1922","PA2057","PA2335","PA2398","PA2466",
+              "PA2688","PA2911","PA3268","PA3407","PA3408","PA3901","PA4168",
+              "PA4221","PA4514","PA4710","PA4897","PA5505")
+TRANSPORT <- c("PA4158","PA4160","PA4161","PA4222","PA4223","PA4358","PA4687",
+               "PA4688","PA4705","PA4706","PA4707","PA4708","PA4709","PA5216")
+ENERGIZER <- c("PA0197","PA0198","PA0199","PA0406","PA0693","PA5531")
+EFFLUX    <- c("PA2389","PA2390","PA2391")
+REGULATOR <- c("PA0471","PA0472","PA1300","PA1301","PA1911","PA1912","PA2387",
+               "PA2388","PA2426","PA2467","PA2468","PA2663","PA2686","PA2687",
+               "PA3899","PA3900","PA4227","PA4764")
+IRON_HL <- rna_dat$target_id[rna_dat$highlight == "Iron"]
+
+# one reference per cofactor assignment, each resolved and checked
+cofactor_ref <- tribble(
+  ~basis, ~doi, ~evidence,
+  "NADH dehydrogenase I subunit",
+    "10.1126/science.1123809", "Structure of homolog (Thermus complex I, PDB 2FUG)",
+  "Cytochrome c1 of the bc1 complex",
+    "10.1126/science.281.5373.64", "Structure of homolog (bovine bc1, PDB 1BE3)",
+  "Cytochrome b of the bc1 complex",
+    "10.1126/science.281.5373.64", "Structure of homolog (bovine bc1, PDB 1BE3)",
+  "Rieske protein of the bc1 complex",
+    "10.1126/science.281.5373.64", "Structure of homolog (bovine bc1, PDB 1BE3)",
+  "Aconitase catalytic cluster",
+    "10.1038/nsb801", "Structure of homolog (E. coli AcnB, PDB 1L5J)",
+  "Class II fumarase, iron-free isozyme of the [4Fe-4S] class I enzyme",
+    "10.1038/nsb0895-654", "Structure of homolog (E. coli FumC, PDB 1FUO)",
+  "Malate:quinone oxidoreductase, bypasses complex I",
+    "10.1007/s10863-012-9485-5", "Biochemical characterization of homolog (Bacillus PS3)",
+  "Glycolate oxidase iron-sulfur subunit",
+    "10.1128/jb.178.7.2051-2059.1996", "Sequence similarity and mutant phenotype (E. coli glc)",
+  "Formate dehydrogenase catalytic subunit",
+    "10.1126/science.1068186", "Structure of homolog (E. coli Fdn-N, PDB 1KQF)",
+  "Formate dehydrogenase electron-transfer subunit",
+    "10.1126/science.1068186", "Structure of homolog (E. coli Fdn-N, PDB 1KQF)",
+  "Formate dehydrogenase cytochrome b subunit",
+    "10.1126/science.1068186", "Structure of homolog (E. coli Fdn-N, PDB 1KQF)",
+  "Radical-SAM MoaA",
+    "10.1073/pnas.0404624101", "Structure of homolog (S. aureus MoaA, PDB 1TV8)",
+  "Radical-SAM MoaA paralog",
+    "10.1073/pnas.0404624101", "Structure of homolog (S. aureus MoaA, PDB 1TV8)",
+  "Catalase KatA",
+    "10.2210/pdb4e37/pdb", "Structure of this protein (P. aeruginosa KatA, PDB 4E37)",
+  "Ferredoxin-dependent nitrite reductase",
+    "10.1074/jbc.M502560200", "Structure of homolog (M. tuberculosis NirA, PDB 1ZJ8)",
+  "Periplasmic nitrate reductase",
+    "10.1038/nsb994", "Structure of homolog (R. sphaeroides NapAB, PDB 1OGY)",
+  "Dnr, heme-based nitric oxide sensor",
+    "10.1016/j.jmb.2008.03.013", "Structure of this protein (P. aeruginosa DNR, PDB 2Z69)",
+  "NirN",
+    NA_character_, "Not established",
+  "Sulfite reductase haemoprotein",
+    "10.1126/science.270.5233.59", "Structure of homolog (E. coli SiR-HP, PDB 1AOP)",
+  "Taurine dioxygenase, Fe(II) and 2-oxoglutarate dependent",
+    "10.1021/bi016014e", "Structure of homolog (E. coli TauD with Fe(II), PDB 1GY9)",
+  "IscR, cluster-sensing regulator",
+    "10.1073/pnas.251550898", "Biochemical characterization of homolog (E. coli IscR, EPR)",
+  "IscS cysteine desulfurase, sulfur donor",
+    "10.1021/bi000931n", "Biochemical characterization of homolog (E. coli IscS/IscU)",
+  "IscU scaffold",
+    "10.1021/bi000931n", "Biochemical characterization of homolog (E. coli IscU)",
+  "IscA",
+    "10.1021/bi000931n", "Biochemical characterization of homolog (E. coli ISC system)",
+  "HscB co-chaperone", NA_character_, "No cofactor",
+  "HscA chaperone", NA_character_, "No cofactor",
+  "MoaB, no iron center", NA_character_, "No cofactor",
+  "Bacterial ferritin",
+    "10.1021/bi9015204", "Structure of paralog (P. aeruginosa BfrB, PDB 3IS7)",
+  "Probable bacterioferritin",
+    "10.1021/bi9015204", "Structure of paralog (P. aeruginosa BfrB, PDB 3IS7)",
+  "Bacterioferritin BfrB",
+    "10.1021/bi9015204", "Structure of this protein (P. aeruginosa BfrB, PDB 3IS7)",
+  "Bfd, bacterioferritin-associated ferredoxin",
+    "10.1021/ja305180n", "Structure of this protein (P. aeruginosa BfrB:Bfd, PDB 4E6K)",
+  "F1F0 ATP synthase subunit, no metal center", NA_character_, "No cofactor")
+
+# classes with no per-gene cofactor take one reference for the class
+class_ref <- tribble(
+  ~class, ~doi, ~evidence,
+  "Siderophore and heme receptors", "10.1016/j.jmb.2005.08.004",
+    "Structure of this class (P. aeruginosa FptA with ferric pyochelin, PDB 1XKW)",
+  "Siderophore biosynthesis", NA_character_, "No cofactor; iron-regulated",
+  "Siderophore efflux", NA_character_, "No cofactor; iron-regulated",
+  "Regulators", NA_character_, "No cofactor; iron-regulated",
+  "TonB-ExbBD energizers", NA_character_, "No cofactor",
+  "Inner-membrane and periplasmic transport", NA_character_, "No cofactor")
+
+iron_tbl <- rna_res %>%
+  filter(!is.na(padj), padj < ALPHA,
+         target_id %in% c(iron_cofactor$target_id, RECEPTOR, TRANSPORT,
+                          ENERGIZER, EFFLUX, REGULATOR, IRON_HL) |
+           grepl("^nuo", gene_name)) %>%
+  left_join(iron_cofactor, by = "target_id") %>%
+  mutate(
+    class = case_when(
+      !is.na(class)                             ~ class,
+      grepl("^nuo", gene_name)                  ~ "Respiratory chain",
+      grepl("^atp", gene_name)                  ~ "Respiratory chain",
+      target_id %in% RECEPTOR                   ~ "Siderophore and heme receptors",
+      target_id %in% TRANSPORT                  ~ "Inner-membrane and periplasmic transport",
+      target_id %in% ENERGIZER                  ~ "TonB-ExbBD energizers",
+      target_id %in% EFFLUX                     ~ "Siderophore efflux",
+      target_id %in% REGULATOR                  ~ "Regulators",
+      TRUE                                      ~ "Siderophore biosynthesis"),
+    cofactor = case_when(
+      !is.na(cofactor)                          ~ cofactor,
+      grepl("^nuo", gene_name)                  ~ "[Fe-S] clusters",
+      grepl("^atp", gene_name)                  ~ "None",
+      class == "Siderophore and heme receptors" ~ "None, binds Fe(III)-siderophore or heme",
+      class == "TonB-ExbBD energizers"          ~ "None",
+      TRUE                                      ~ "None, iron-regulated"),
+    basis = case_when(
+      !is.na(basis)                             ~ basis,
+      grepl("^nuo", gene_name)                  ~ "NADH dehydrogenase I subunit",
+      grepl("^atp", gene_name)                  ~ "F1F0 ATP synthase subunit, no metal center",
+      TRUE                                      ~ "Assigned from functional class")) %>%
+  left_join(cofactor_ref, by = "basis") %>%
+  left_join(class_ref, by = "class", suffix = c("", "_cls")) %>%
+  mutate(doi = coalesce(doi, doi_cls),
+         evidence = coalesce(evidence, evidence_cls),
+         evidence = ifelse(is.na(evidence), "Assigned from functional class",
+                           evidence)) %>%
+  transmute(`Locus Tag` = target_id,
+            `Gene` = ifelse(is.na(gene_name), "", gene_name),
+            `Product` = product, `Functional Class` = class,
+            `Iron Cofactor` = ifelse(str_starts(cofactor, "None"), NA_character_,
+                                     cofactor),
+            `Fold Change (Coculture/Monoculture)` =
+              fc_signed(log2FoldChange_shrunk),
+            `log2 Fold Change` = rnd(log2FoldChange_shrunk),
+            `BH-Adjusted P-Value` = padj,
+            `Reference (DOI)` = doi,
+            `Evidence for Cofactor Assignment` = evidence) %>%
+  arrange(`Functional Class`, desc(`log2 Fold Change`))
+
+safe_write_tsv(iron_tbl, file.path(sup_dir, "Table_S5.tsv"), na = "")
+```
+
+### S6: Detected Proteins
+
+```{r table_s6, include=FALSE}
+s6 <- prot_dat %>%
+  transmute(`UniProt Accession` = Accession, `Gene Name` = Gene,
+            `Protein` = Description,
+            # no PGD assignment at all, which is not an assignment of unknown
+            `Localization` = ifelse(is.na(localization) | localization == "",
+                                    "not assigned", localization),
+            `Extracellular` = ifelse(secreted, "yes", "no"),
+            `log10 Intensity` = rnd(log10_intensity, 2),
+            `Fold Change (Coculture/Monoculture)` = fc_signed(log2FC),
+            `log2 Fold Change` = rnd(log2FC),
+            `P-Value` = p_value, `BH-Adjusted P-Value` = adj_p) %>%
+  arrange(`BH-Adjusted P-Value`, desc(abs(`log2 Fold Change`)))
+
+safe_write_tsv(s6, file.path(sup_dir, "Table_S6.tsv"), na = "")
+```
+
+## Figures
+
+### Figure 1A
+
+```{r fig_1A, include=FALSE}
+build_fev1_panel <- function(thr, show_title = TRUE, asp = 1) {
+  d <- build_groups(thr)
+  n4 <- table(d$grp)
+  alab <- setNames(vapply(group_levels4, function(g)
+    paste0(label_templates4[[g]], "<br/>(N=", n4[[g]], ")"), character(1)),
+    group_levels4)
+
+  pw <- suppressWarnings(pairwise.wilcox.test(d$FEV1, droplevels(d$grp),
+          p.adjust.method = "BH", exact = FALSE)$p.value)
+  getp <- function(a, b)
+    if (!is.null(pw) && a %in% rownames(pw) && b %in% colnames(pw)) pw[a, b] else NA
+
+  yr <- diff(range(d$FEV1)); ymax <- max(d$FEV1)
+  l1 <- ymax + 0.06 * yr; l2 <- ymax + 0.15 * yr
+  l3 <- ymax + 0.24 * yr; ytop <- ymax + 0.33 * yr
+  brk <- list()
+  for (cmp in list(list("Achromobacter only", 3, l1), list("Pseudomonas only", 2, l2),
+                   list("No pathogen", 1, l3))) {
+    p <- getp("Both", cmp[[1]])
+    if (!is.na(p)) brk <- c(brk, bracket(cmp[[2]], 4, cmp[[3]], fmt_p(p), LABEL_MM, 0.4, yr))
+  }
+
+  ggplot(d, aes(grp, FEV1, fill = grp)) +
+    geom_boxplot(width = 0.55, notch = TRUE, alpha = 0.85, linewidth = 0.4,
+                 outlier.shape = 16, outlier.size = 0.7) +
+    scale_fill_manual(values = group_cols4, guide = "none") +
+    scale_x_discrete(labels = alab, drop = FALSE) +
+    scale_y_continuous(breaks = seq(0, 125, 25), limits = c(0, ytop),
+                       expand = expansion(mult = c(0, 0))) +
+    labs(x = NULL, y = expression("Lung Function (FEV"[1]*" pp)"),
+         title = if (show_title) paste0("Presence threshold = ", thr, "%") else NULL) +
+    brk +
+    base_theme() +
+    theme(aspect.ratio = asp, legend.position = "none",
+          plot.title = element_text(size = AXIS_TITLE_PT, hjust = 0.5),
+          axis.text.x = element_markdown(angle = 45, hjust = 1))
+}
+
+panel_1a <- build_fev1_panel(1, show_title = FALSE, asp = 1)
+```
+
+### Figure 1B
+
+```{r fig_1B, include=FALSE}
+sev_ymax <- max(sev_ci$hi)
+l1 <- sev_ymax * 1.05; l2 <- sev_ymax * 1.14
+l3 <- sev_ymax * 1.23; sev_top <- sev_ymax * 1.34
+
+panel_1b <- ggplot(sev_ci, aes(grp, pct, fill = grp)) +
+  geom_pointrange(aes(ymin = lo, ymax = hi), shape = 21, color = "black",
+                  stroke = 0.5, linewidth = 0.5, size = 0.85) +
+  scale_fill_manual(values = group_cols4, guide = "none") +
+  scale_x_discrete(labels = axis_labels4) +
+  scale_y_continuous(limits = c(0, sev_top), expand = expansion(mult = c(0, 0.02))) +
+  labs(x = NULL, y = "Proportion of pwCF with Severe Disease (%)") +
+  bracket(3, 4, l1, fmt_p(sev_padj[1]), LABEL_MM, 0.4, sev_ymax) +
+  bracket(2, 4, l2, fmt_p(sev_padj[2]), LABEL_MM, 0.4, sev_ymax) +
+  bracket(1, 4, l3, fmt_p(sev_padj[3]), LABEL_MM, 0.4, sev_ymax) +
+  base_theme() +
+  theme(legend.position = "none",
+        axis.text.x  = element_markdown(angle = 45, hjust = 1),
+        axis.title.y = element_markdown())
+```
+
+### Figure 1C
+
+```{r fig_1C, include=FALSE}
+panel_1c <- ggplot(res_spec, aes(diff, pathogen)) +
+  geom_vline(xintercept = 0, linetype = 2, color = "gray50") +
+  geom_errorbar(aes(xmin = lo, xmax = hi), orientation = "y",
+                width = 0.2, linewidth = 0.4) +
+  geom_point(aes(fill = pathogen), shape = 21, color = "black", stroke = 0.4,
+             size = 3.4) +
+  geom_text(aes(x = hi, label = plab), parse = TRUE, hjust = 0, nudge_x = 0.4,
+            size = LABEL_MM) +
+  scale_fill_manual(values = pathogen_palette, guide = "none") +
+  scale_y_discrete(labels = function(x)
+    paste0("<i>", x, "</i><br>(N=", n_present_adj[x], ")")) +
+  scale_x_continuous(breaks = seq(-15, 15, 5), limits = c(-17, 17),
+                     expand = expansion(mult = 0),
+                     labels = function(x)
+                       ifelse(x > 0, paste0("+", x), as.character(x))) +
+  labs(x = "Adjusted FEV<sub>1</sub> pp Difference<br>when Present with <i>Pseudomonas</i>",
+       y = "Coinfecting Pathogen") +
+  base_theme() +
+  theme(legend.position = "none", axis.text.y = element_markdown(),
+        axis.title.x = element_markdown())
+```
+
+### Figure 1
+
+```{r fig_1, include=FALSE}
+sq <- theme(aspect.ratio = 1)
+arr_1 <- egg::ggarrange(panel_1a + sq, panel_1b + sq, panel_1c + sq,
+                        ncol = 3, draw = FALSE)
+arr_1 <- add_tags(arr_1, c("A", "B", "C"))
+
+save_grob(arr_1, "./figures/Figure_1.pdf", 13.5, 4.75)
+```
+
+### Figure 3A
+
+```{r fig_3A, include=FALSE}
+open_dev <- function(out, w, h) {
+  if (grepl("[.]png$", out)) png(out, width = w, height = h, units = "in",
+                                 res = 300, bg = "white", type = "cairo")
+  else cairo_pdf(out, width = w, height = h)
+}
+
+build_fig_3a <- function(out, sq_param = PANEL_IN, axis_pt = AXIS_TEXT_PT,
+                         title_pt = AXIS_TITLE_PT,
+                         leg_title_pt = LEGEND_TITLE_PT,
+                         leg_text_pt = LEGEND_TEXT_PT,
+                         fig_w = 4.8, fig_h = 8.1) {
+  species_vec <- sub("^Achromobacter ", "A. ", gcf_md$Taxonomy)
+  source_vec  <- gcf_md$Source
+  pvd_vec     <- gcf_md$Induces_Pyoverdine
+  col_labels  <- gcf_md$Strain        # display names keep the space
+
+  species_cols <- SPECIES_COLS
+
+  source_vec[source_vec %in% c("Environment", "Other")] <- "Other"
+  source_relabel <- c("CF Sputum"          = "Sputum (CF)",
+                      "Non-CF Sputum"      = "Sputum (Non-CF)",
+                      "Unspecified Sputum" = "Sputum (Unspecified)",
+                      "CF Oropharynx"      = "Oropharynx (CF)")
+  idx <- source_vec %in% names(source_relabel)
+  source_vec[idx] <- source_relabel[source_vec[idx]]
+
+  # order here drives legend order
+  source_cols <- c("Sputum (CF)"          = "#8cba7e",
+                   "Sputum (Non-CF)"      = "#b3d3a3",
+                   "Sputum (Unspecified)" = "#d2e5c4",
+                   "Oropharynx (CF)"      = "#8cc1b6",
+                   "Ear"                  = "#88a0c4",
+                   "Wound"                = "#d4796d",
+                   "Other"                = "#b3a6c4",
+                   "Unknown"              = "#d9d9d9")
+  source_vec  <- factor(source_vec, levels = names(source_cols))
+  source_cols <- source_cols[names(source_cols) %in% unique(source_vec)]
+  pvd_colors  <- c("Yes" = "#6b85a3", "No" = "#dde2ea")
+  species_ordered <- sort(unique(species_vec))
+
+  sq_in   <- sq_param                             # heatmap body is the house square
+  anno_sz <- unit(sq_in / ncol(gcf_mat), "in")    # square annotation cells
+
+  leg_common <- list(grid_height = unit(3.5, "mm"), grid_width = unit(3.5, "mm"),
+                     title_gp = gpar(fontsize = leg_title_pt),
+                     labels_gp = gpar(fontsize = leg_text_pt))
+
+  bottom_anno <- HeatmapAnnotation(
+    `Ind. PVD` = pvd_vec, Source = source_vec, Species = species_vec,
+    col = list(`Ind. PVD` = pvd_colors, Source = source_cols,
+               Species = species_cols),
+    simple_anno_size = anno_sz, annotation_name_side = "left",
+    annotation_name_gp = gpar(fontsize = axis_pt), gap = unit(0, "mm"),
+    annotation_legend_param = list(
+      Species = c(list(at = species_ordered, labels = species_ordered,
+                       title = "Species", nrow = 3,
+                       labels_gp = gpar(fontsize = leg_text_pt, fontface = "italic")),
+                  leg_common["grid_height"], leg_common["grid_width"],
+                  leg_common["title_gp"]),
+      Source     = c(list(title = "Source", at = names(source_cols), ncol = 2),
+                     leg_common),
+      `Ind. PVD` = c(list(title = "Induces PVD", nrow = 1), leg_common)))
+
+  # empty strip reserving room for the y-axis ticks and the alc label
+  left_anno <- rowAnnotation(tk = anno_empty(border = FALSE, width = unit(10, "mm")))
+
+  ht_3a <- Heatmap(
+    gcf_mat, name = "GCF", rect_gp = gpar(type = "none"),
+    cell_fun = function(j, i, x, y, w, h, fill) {
+      fillcol <- if (gcf_mat[i, j] < 1) "white"
+                 else if (rownames(gcf_mat)[i] == ALC_FAM) "#f7ce46"
+                 else if (rownames(gcf_mat)[i] == MET_FAM &&
+                          colnames(gcf_mat)[j] == MET_STRAIN) "#b7410e"
+                 else "black"
+      grid.rect(x, y, w, h, gp = gpar(fill = fillcol, col = NA))
+    },
+    cluster_rows = FALSE, row_order = gcf_row_order,
+    cluster_columns = FALSE, column_order = COL_ORD,
+    top_annotation = HeatmapAnnotation(
+      clado = anno_empty(height = unit(1.6, "cm"), border = FALSE),
+      show_annotation_name = FALSE),
+    show_row_names = FALSE, column_labels = col_labels,
+    column_names_gp = gpar(fontsize = axis_pt), column_names_rot = 45,
+    column_names_side = "bottom",
+    row_title = "BGC", row_title_gp = gpar(fontsize = title_pt, fontface = "bold"),
+    column_title = NULL, bottom_annotation = bottom_anno,
+    left_annotation = left_anno, show_heatmap_legend = FALSE,
+    width = unit(sq_in, "in"), height = unit(sq_in, "in"),
+    border = TRUE, border_gp = gpar(col = "black", lwd = 0.5))
+
+  # cairo_pdf draws a real ASCII hyphen; base pdf() draws a long minus
+    open_dev(out, fig_w, fig_h)
+  ht_drawn <- draw(ht_3a, annotation_legend_side = "bottom",
+                   heatmap_legend_side = "bottom", merge_legends = TRUE)
+  ro <- row_order(ht_drawn); n <- length(ro)
+  decorate_heatmap_body("GCF", {
+    pushViewport(viewport(clip = "off"))
+    for (p in seq_len(n)) {
+      yk <- unit(1 - (p - 0.5) / n, "npc")
+      grid.segments(unit(0, "npc"), yk, unit(0, "npc") - unit(1, "mm"), yk,
+                    gp = gpar(lwd = 0.6))
+      if (rownames(gcf_mat)[ro[p]] == ALC_FAM)
+        grid.text("alc", x = unit(0, "npc") - unit(1.6, "mm"), y = yk,
+                  just = "right", gp = gpar(fontface = "italic", fontsize = axis_pt))
+    }
+    popViewport()
+  })
+
+  decorate_annotation("clado", {
+    pushViewport(viewport(clip = "off"))
+    ns <- ncol(gcf_mat); ym <- max(clado_seg$y, clado_seg$yend)
+    grid.segments((clado_seg$x - 0.5) / ns, clado_seg$y / ym,
+                  (clado_seg$xend - 0.5) / ns, clado_seg$yend / ym,
+                  gp = gpar(lwd = 1.2))
+    popViewport()
+  })
+  invisible(dev.off())
+}
+
+build_fig_3a("./figures/Figure_3A.pdf")
+```
+
+### Figure 7A
+
+```{r fig_7A, include=FALSE}
+hl <- rna_dat %>% filter(highlight != "Not highlighted", padj < FDR_CUT) %>%
+  droplevels() %>% arrange(highlight == "Virulence")
+bg <- rna_dat %>% anti_join(hl, by = "target_id")
+
+YBREAK <- ceiling(max(-log10(hl$padj), na.rm = TRUE) * 1.08)
+YTOP   <- ceiling(max(rna_dat$neg_log10_q, na.rm = TRUE) / 10) * 10 + 5
+
+XLIM <- ceiling(max(abs(rna_dat$log2FoldChange_shrunk), na.rm = TRUE) * 1.02)
+
+pvd_loci <- geneset_members %>% filter(set == "Pyoverdine synthesis") %>%
+  pull(target_id)
+IMPORT <- c("PA2398",   # fpvA, ferripyoverdine receptor
+            "PA4168")   # fpvB, second ferric pyoverdine receptor
+NAMED_VF <- c("PA1148",   # toxA, exotoxin A
+              "PA0707")   # toxR / regA, the activator that drives it
+
+volc_lab <- hl %>% filter(target_id %in% c(pvd_loci, IMPORT, NAMED_VF)) %>%
+  mutate(lab = ifelse(is.na(gene_name) | gene_name == "", target_id, gene_name))
+volc_lab <- volc_lab[order(-volc_lab$neg_log10_q), ]
+volc_lab$side <- rep(c("right", "left"), length.out = nrow(volc_lab))
+stopifnot(all(volc_lab$neg_log10_q < YBREAK))
+
+panel_7a <- ggplot() +
+  geom_hline(yintercept = -log10(FDR_CUT), linetype = "dashed",
+             color = GUIDE_COL, linewidth = GUIDE_LW) +
+  geom_point(data = bg, aes(log2FoldChange_shrunk, neg_log10_q,
+                            size = log10_expr),
+             color = "gray74", fill = "gray86", shape = 21, stroke = 0.12,
+             alpha = 0.55) +
+  geom_point(data = hl, aes(log2FoldChange_shrunk, neg_log10_q,
+                            size = log10_expr, fill = highlight),
+             color = "black", shape = 21, stroke = 0.3) +
+  geom_text_repel(data = volc_lab[volc_lab$side == "left", ],
+                  aes(log2FoldChange_shrunk, neg_log10_q, label = lab),
+                  xlim = c(-XLIM, -1.6), size = LABEL_MM, fontface = "italic",
+                  color = "black", bg.color = "white", bg.r = 0.16,
+                  segment.size = 0.2, segment.color = "gray45",
+                  min.segment.length = 0, box.padding = 0.25,
+                  point.padding = 0.1, force = 2, force_pull = 0.2,
+                  max.overlaps = Inf, max.iter = 50000, seed = SEED) +
+  geom_text_repel(data = volc_lab[volc_lab$side == "right", ],
+                  aes(log2FoldChange_shrunk, neg_log10_q, label = lab),
+                  xlim = c(2.4, XLIM), size = LABEL_MM, fontface = "italic",
+                  color = "black", bg.color = "white", bg.r = 0.16,
+                  segment.size = 0.2, segment.color = "gray45",
+                  min.segment.length = 0, box.padding = 0.25,
+                  point.padding = 0.1, force = 2, force_pull = 0.2,
+                  max.overlaps = Inf, max.iter = 50000, seed = SEED) +
+  scale_fill_manual(values = HL_COLS, name = NULL, drop = FALSE) +
+  # upper end matches the proteomics volcano so the two read at one scale
+  scale_size_continuous(range = c(0.25, 2.6), breaks = c(1, 2, 3, 4, 5),
+                        name = SIZE_LAB, limits = range(rna_dat$log10_expr)) +
+  guides(fill = guide_legend(override.aes = list(size = 2.6), order = 1),
+         size = guide_legend(order = 2)) +
+  labs(x = XLAB_LFC, y = YLAB_Q) +
+  scale_x_continuous(breaks = seq(-XLIM, XLIM, 3)) +
+  scale_y_continuous(transform = scales::pseudo_log_trans(base = 10),
+                     breaks = c(0, 1, 5, 10, 25, 50, 100)) +
+  coord_cartesian(ylim = c(0, YTOP), xlim = c(-XLIM, XLIM)) +
+  base_theme()
+```
+
+### Figure 7B
+
+```{r fig_7B, include=FALSE}
+ora_lim <- max(abs(rna_ora$signed_lor)) * 1.08
+ORA_Q_MAX <- ceiling(max(rna_ora$neglog10q) / 5) * 5
+
+rna_ora <- rna_ora %>%
+  mutate(signed_q = ifelse(direction == "Enriched in Coculture",
+                           neglog10q, -neglog10q))
+
+panel_7b <- ggplot(rna_ora, aes(signed_lor, term, fill = signed_q,
+                                size = frac_enriched)) +
+  geom_vline(xintercept = 0, linetype = "dashed", color = GUIDE_COL,
+             linewidth = GUIDE_LW) +
+  geom_point(shape = 21, color = "black", stroke = 0.3) +
+  scale_x_continuous(limits = c(-ora_lim, ora_lim), breaks = seq(-8, 8, 2),
+                     expand = expansion(mult = c(0.02, 0.02))) +
+  # hue is direction, saturation is the adjusted P
+  scale_fill_gradientn(
+    colors = c("#1d4e6b", "#4b86b8", "#c6dcec", "#f2f2f2",
+                "#eac6d2", "#c05478", unname(HL_COLS["Iron"])),
+    values = scales::rescale(c(-ORA_Q_MAX, -5, -1.3, 0, 1.3, 5, ORA_Q_MAX),
+                             from = c(-ORA_Q_MAX, ORA_Q_MAX)),
+    limits = c(-ORA_Q_MAX, ORA_Q_MAX),
+    breaks = seq(-ORA_Q_MAX, ORA_Q_MAX, 5), labels = function(x) abs(x),
+    name = expression(-log[10]~"BH-Adjusted"~italic(P)*"-Value")) +
+  scale_size_continuous(range = c(0.8, 3.8), limits = c(0, 1),
+                        breaks = c(0.25, 0.5, 0.75, 1),
+                        name = "Fraction Enriched") +
+  # rectangles keeps the colorbar vector in the PDF
+  guides(fill = guide_colorbar(order = 1, display = "rectangles",
+                                barheight = unit(0.32, "cm"),
+                                barwidth = unit(4.6, "cm"),
+                                title.position = "left", title.vjust = 0.9),
+         size = guide_legend(order = 2, nrow = 1, title.position = "left",
+                             title.vjust = 0.5,
+                             override.aes = list(fill = "gray45"))) +
+  labs(x = expression(log[2]~"Odds Ratio (Coculture/Monoculture)"), y = NULL) +
+  base_theme() +
+  theme(axis.text.y = element_text(size = LABEL_PT), legend.box = "vertical",
+        legend.spacing.y = unit(0, "pt"),
+        plot.margin = margin(6, 24, 6, 20))
+```
+
+### Figure 7C Inset
+
+```{r fig_8B_inset, include=FALSE}
+INSET_PT       <- 8
+INSET_TITLE_PT <- 8 
+
+jk_pts <- jk_loo %>% mutate(set = factor(set, levels = names(LAB)))
+fur_top <- max(c(jk_pts$pct, fur_prop$pct))
+
+lab_pos <- jk_pts %>% group_by(set) %>%
+  summarize(y = max(pct) + fur_top * 0.035, .groups = "drop") %>%
+  left_join(fur_prop %>%
+              mutate(set = factor(set, levels = names(LAB))) %>%
+              dplyr::select(set, letter), by = "set")
+INSET_TOP <- ceiling(max(lab_pos$y) / 5) * 5
+
+build_fbs_inset <- function(pt = INSET_PT, title_pt = INSET_TITLE_PT)
+  ggplot(jk_pts, aes(set, pct, fill = set)) +
+
+  geom_boxplot(coef = Inf, outlier.shape = NA, width = 0.55, linewidth = 0.25,
+               alpha = 0.85) +
+  geom_text(data = lab_pos, aes(set, y, label = letter), inherit.aes = FALSE,
+            size = pt / .pt, vjust = 0, fontface = "bold") +
+  scale_fill_manual(values = COL, guide = "none") +
+
+  scale_y_continuous(limits = c(0, INSET_TOP), breaks = seq(0, INSET_TOP, 5),
+                     expand = expansion(0, 0)) +
+ 
+  coord_cartesian(clip = "off") +
+  labs(x = NULL, y = "Genes with FBS\nin Promoter (%)") +
+  base_theme() +
+  theme(aspect.ratio = 1,
+        axis.text.x = element_blank(), axis.ticks.x = element_blank(),
+        axis.ticks = element_line(color = "black", linewidth = 0.4),
+        axis.ticks.length = unit(2, "pt"),
+        axis.text.y = element_text(size = pt, margin = margin(r = 1)),
+        axis.title.y = element_text(size = title_pt, lineheight = 0.95,
+                                   margin = margin(r = 1)),
+        plot.background = element_rect(fill = "white", color = NA),
+        plot.margin = margin(5, 6, 4, 4))
+
+panel_fbs_inset <- build_fbs_inset()
+```
+
+### Figure 7B and 7C
+
+```{r fig_7BC, include=FALSE}
+logo_seqs <- fur_fbs$site
+
+panel_fur_logo <- ggseqlogo(logo_seqs, method = "bits", seq_type = "dna") +
+  scale_x_continuous(breaks = c(1, 5, 10, 15, 19),
+                     expand = expansion(mult = c(0.01, 0.01))) +
+  labs(x = "Fur Box Position (bp)", y = "Bits") +
+  base_theme() +
+  theme(legend.position = "none")
+
+fbs_v <- fur_fbs %>%
+  left_join(dplyr::select(rna_res, target_id, baseMean), by = "target_id") %>%
+  mutate(negq = -log10(padj),
+         log10_expr = log10(baseMean + 1),
+         call = factor(case_when(
+           padj < ALPHA & log2FoldChange_shrunk > 0 ~ "Coculture",
+           padj < ALPHA & log2FoldChange_shrunk < 0 ~ "Monoculture",
+           TRUE                                     ~ "Not Enriched"),
+           levels = c("Monoculture", "Not Enriched", "Coculture")))
+
+FBS_XLIM <- 2
+stopifnot(max(abs(fbs_v$log2FoldChange_shrunk)) < FBS_XLIM)
+FBS_YTOP <- max(fbs_v$negq) * 1.04
+FBS_COL  <- c("Monoculture"  = "#4b86b8",
+              "Not Enriched" = "gray70",
+              "Coculture"    = unname(HL_COLS["Iron"]))
+
+fx <- function(f) -FBS_XLIM + f * 2 * FBS_XLIM
+fy <- function(f) f * FBS_YTOP
+
+build_fbs_volcano <- function(inset = panel_fbs_inset)
+  ggplot(fbs_v, aes(log2FoldChange_shrunk, negq)) +
+  geom_hline(yintercept = -log10(ALPHA), linetype = "dashed",
+             color = GUIDE_COL, linewidth = GUIDE_LW) +
+  geom_point(aes(fill = call, size = log10_expr), shape = 21, color = "black",
+             stroke = 0.3) +
+  scale_size_continuous(range = c(0.25, 2.6), breaks = c(1, 2, 3, 4, 5),
+                        name = SIZE_LAB, limits = range(rna_dat$log10_expr)) +
+  annotation_custom(ggplotGrob(inset),
+                    xmin = fx(0.005), xmax = fx(0.475),
+                    ymin = fy(0.67),   ymax = fy(1.03)) +
+  scale_fill_manual(values = FBS_COL, name = NULL, drop = FALSE) +
+  scale_x_continuous(limits = c(-FBS_XLIM, FBS_XLIM),
+                     breaks = seq(-FBS_XLIM, FBS_XLIM, 1),
+                     expand = expansion(mult = c(0.02, 0.02))) +
+  scale_y_continuous(limits = c(NA, FBS_YTOP),
+                     expand = expansion(mult = c(0.03, 0.02))) +
+  guides(fill = guide_legend(order = 1, nrow = 1,
+                             override.aes = list(size = 2.6)),
+         size = guide_legend(order = 2, nrow = 1)) +
+  labs(x = XLAB_LFC, y = YLAB_Q) +
+  base_theme() +
+  theme(legend.position = "bottom", legend.margin = margin(0, 0, 0, 0))
+
+panel_fur_resp <- build_fbs_volcano()
+```
+
+### Figure 7
+
+```{r fig_7, include=FALSE}
+pin <- function(p, h = PANEL_IN)
+  egg::set_panel_size(p + AS_GROB, width = unit(PANEL_IN, "in"),
+                      height = unit(h, "in"))
+win <- function(g) grid::convertWidth(sum(g$widths), "in", valueOnly = TRUE)
+hin <- function(g) grid::convertHeight(sum(g$heights), "in", valueOnly = TRUE)
+pad_bottom <- function(g, H) {
+  d <- H - hin(g)
+  if (d > 1e-6) gtable::gtable_add_rows(g, unit(d, "in")) else g
+}
+
+gs_mid <- align_panels(list(pin(panel_fur_logo, h = 0.9), pin(panel_fur_resp)))
+gs_mid <- Map(add_tags, gs_mid, c("B", "C"))
+
+g_a <- add_tags(pin(panel_7a), "A")   
+g_d <- add_tags(pin(panel_7b), "D")
+
+h_hat  <- hin(gs_mid[[1]])
+h_body <- max(hin(g_a), hin(g_d), hin(gs_mid[[2]]))
+g_a <- pad_bottom(g_a, h_body)
+g_d <- pad_bottom(g_d, h_body)
+gs_mid[[2]] <- pad_bottom(gs_mid[[2]], h_body)
+
+mid <- gridExtra::arrangeGrob(grobs = gs_mid, ncol = 1,
+                              heights = unit(c(h_hat, h_body), "in"))
+
+ws <- c(win(g_a), win(gs_mid[[1]]), win(g_d))
+arr_7 <- gridExtra::arrangeGrob(
+  grobs = list(g_a, mid, g_d),
+  layout_matrix = rbind(c(NA, 2, NA),
+                        c(1,  2, 3)),
+  widths = unit(ws, "in"), heights = unit(c(h_hat, h_body), "in"))
+
+save_grob(arr_7, "./figures/Figure_7.pdf", sum(ws), h_hat + h_body)
+```
+
+### Figure 8
+
+```{r fig_8, include=FALSE}
+prot_volcano_panel <- function(d, label_all = FALSE) {
+  hl <- filter(d, highlight != "Not highlighted", significant) %>%
+    droplevels() %>%
+    arrange(highlight == "Virulence")
+  bg <- anti_join(d, hl, by = "Accession")
+  lab <- (if (label_all) filter(d, significant) else filter(d, do_label)) %>%
+
+    mutate(nx = case_when(label == "toxA" ~ 0.20, label == "lasB" ~ 0.02,
+                          label == "plcB" ~ 0.30, label == "Pyocin S4" ~ 0.22,
+                          label == "cdrA" ~ 0.15, label == "pra" ~ 0.02,
+                          label == "liuR" ~ -0.05, TRUE ~ 0),
+           ny = case_when(label == "toxA" ~ 0.05, label == "lasB" ~ 0.14,
+                          label == "plcB" ~ -0.12, label == "Pyocin S4" ~ 0.15,
+                          label == "cdrA" ~ 0.03, label == "pra" ~ 0.14,
+                          label == "liuR" ~ 0.12, TRUE ~ 0))
+  ggplot() +
+    geom_hline(yintercept = -log10(FDR_CUT), linetype = "dashed",
+               color = GUIDE_COL, linewidth = GUIDE_LW) +
+    geom_vline(xintercept = c(-FC_CUT, FC_CUT), linetype = "dashed",
+               color = GUIDE_COL, linewidth = GUIDE_LW) +
+    geom_point(data = bg, aes(log2FC, neg_log10_adj_p, size = log10_intensity),
+               color = "gray74", fill = "gray86", shape = 21, stroke = 0.12,
+               alpha = 0.55) +
+    geom_point(data = hl, aes(log2FC, neg_log10_adj_p, size = log10_intensity,
+                              fill = highlight),
+               color = "black", shape = 21, stroke = 0.3) +
+    geom_text_repel(data = lab, aes(log2FC, neg_log10_adj_p, label = label_disp,
+                                    color = highlight),
+                    nudge_x = lab$nx, nudge_y = lab$ny, fontface = "plain",
+                    size = LABEL_MM, segment.size = 0.2,
+                    segment.color = "gray55",
+                    min.segment.length = 0, box.padding = 0.28,
+                    max.overlaps = Inf, seed = 1, show.legend = FALSE) +
+    scale_fill_manual(values = HL_COLS, name = NULL, drop = FALSE) +
+    scale_color_manual(values = c(HL_COLS, "Not highlighted" = "gray25"),
+                        guide = "none") +
+    scale_size_continuous(range = c(0.12, 2.6), breaks = c(7, 8, 9, 10, 11),
+                          name = expression(log[10]~"Intensity")) +
+    guides(fill = guide_legend(override.aes = list(size = 2), order = 1),
+           size = guide_legend(order = 2)) +
+    labs(x = XLAB_LFC, y = YLAB_Q) +
+    base_theme()
+}
+
+FLAGELLAR <- c("flgD", "flgE", "flgH", "flgI", "flgK", "flgL", "flhA", "fliA",
+               "fliC", "fliD", "fliF", "fliG", "fliI", "fliM", "fliN", "fliO",
+               "motA", "motB", "motD")
+
+fig8_dat <- prot_dat %>%
+  filter(secreted) %>%
+  mutate(highlight = ifelse(Gene %in% FLAGELLAR, "Not highlighted",
+                            as.character(highlight)),
+         highlight = factor(highlight, levels = levels(prot_dat$highlight)),
+         significant = adj_p < FDR_CUT,
+         do_label = significant &
+           (highlight != "Not highlighted" | label == "Pyocin S4"))
+
+save_panel(prot_volcano_panel(fig8_dat),
+           "./figures/Figure_8.pdf")
+```
+
+### Figure S1
+
+```{r fig_S1A, include=FALSE}
+ylab_thr <- setNames(paste0("&ge;", res_thresh$threshold, "%<br>(n=",
+                            res_thresh$n_achro, ")"),
+                     as.character(res_thresh$thr))
+
+panel_s1a <- ggplot(res_thresh, aes(diff, thr)) +
+  geom_vline(xintercept = 0, linetype = 2, color = "gray50") +
+  geom_errorbar(aes(xmin = lo, xmax = hi), orientation = "y",
+                width = 0.2, linewidth = 0.4) +
+  geom_point(shape = 21, fill = "#911c43", color = "black", stroke = 0.4,
+             size = 2.8) +
+  geom_text(aes(x = hi, label = plab), parse = TRUE, hjust = 0, nudge_x = 0.6,
+            size = LABEL_MM) +
+  scale_y_discrete(labels = ylab_thr) +
+  scale_x_continuous(breaks = seq(-20, 0, 5),
+                     limits = c(min(res_thresh$lo) - 1, max(res_thresh$hi) + 8)) +
+  labs(x = "Adjusted FEV<sub>1</sub> pp Difference<br>when Present with <i>Pseudomonas</i>",
+       y = "<i>Achromobacter</i> Relative Abundance Threshold") +
+  base_theme() +
+  theme(aspect.ratio = 1, legend.position = "none",
+        axis.text.y = element_markdown(), axis.title.x = element_markdown(),
+        axis.title.y = element_markdown())
+```
+
+```{r fig_S1B, include=FALSE}
+lab_rho <- paste0("italic(rho)*\"=",
+                  formatC(unname(sp_dose$estimate), format = "f", digits = 2), "\"")
+lab_p   <- paste0("italic(P)*\"=",
+                  formatC(sp_dose$p.value, format = "f", digits = 3), "\"")
+
+set.seed(SEED)
+coinf_j <- coinf %>% mutate(xj = pmin(100, cumulative + runif(n(), -2, 2)),
+                            yj = FEV1 + runif(n(), -2, 2))
+pie_pal <- c(Achromobacter = "#911c43", Pseudomonas = "#e9f5a3",
+             Other = "#d9d9d9")
+
+leg_df <- tibble(x = 50, y = 60,
+                 cat = factor(c("Achromobacter", "Pseudomonas", "Other"),
+                              levels = c("Achromobacter", "Pseudomonas", "Other")))
+
+panel_s1b <- ggplot() +
+  geom_vline(xintercept = 50, linetype = 2, color = "gray50") +
+  geom_smooth(data = coinf_j, aes(cumulative, FEV1), method = "lm",
+              formula = y ~ x, se = TRUE, color = "black", linewidth = 0.5,
+              fill = "gray80") +
+  geom_scatterpie(data = coinf_j, aes(x = xj, y = yj, r = 1.5),
+                  cols = c("Achromobacter", "Pseudomonas", "Other"),
+                  color = "black", linewidth = 0.1, show.legend = FALSE) +
+  geom_point(data = leg_df, aes(x = x, y = y, fill = cat), shape = 21,
+             alpha = 0, size = 3.4, stroke = 0.3) +
+  scale_fill_manual(values = pie_pal, name = NULL,
+                    breaks = c("Achromobacter", "Pseudomonas", "Other"),
+                    labels = c("<i>Achromobacter</i>", "<i>Pseudomonas</i>", "Other"),
+                    guide = guide_legend(override.aes = list(alpha = 1, size = 3.4,
+                                                             stroke = 0.3))) +
+  scale_x_continuous(breaks = seq(0, 100, 25), limits = c(-3, 103),
+                     expand = expansion(mult = c(0, 0))) +
+  scale_y_continuous(breaks = seq(0, 125, 25), limits = c(0, 125),
+                     expand = expansion(mult = c(0, 0.03))) +
+  annotate("text", x = 66, y = 124, hjust = 0, vjust = 1, label = lab_rho,
+           parse = TRUE, size = LABEL_MM) +
+  annotate("text", x = 66, y = 117, hjust = 0, vjust = 1, label = lab_p,
+           parse = TRUE, size = LABEL_MM) +
+  labs(x = "Combined Relative Abundance of<br><i>Achromobacter</i> and <i>Pseudomonas</i> (%)",
+       y = expression("Lung Function (FEV"[1]*" pp)")) +
+  base_theme() +
+  theme(aspect.ratio = 1, axis.title.x = element_markdown(color = "black"),
+        legend.position = "bottom", legend.text = element_markdown(),
+        legend.margin = margin(0, 0, 0, 0))
+```
+
+```{r fig_S1, include=FALSE}
+
+cairo_pdf(tempfile(fileext = ".pdf"), width = 7, height = 10)
+gs_s1 <- align_panels(lapply(list(panel_s1a, panel_s1b), function(p)
+  egg::set_panel_size(p + AS_GROB, width = unit(PANEL_IN, "in"),
+                      height = unit(PANEL_IN, "in"))))
+gs_s1 <- Map(add_tags, gs_s1, c("A", "B"))
+
+h_s1 <- vapply(gs_s1, function(g)
+  grid::convertHeight(sum(g$heights), "in", valueOnly = TRUE), numeric(1))
+w_s1 <- grid::convertWidth(sum(gs_s1[[1]]$widths), "in", valueOnly = TRUE)
+invisible(dev.off())
+
+arr_s1 <- gridExtra::arrangeGrob(grobs = gs_s1, ncol = 1,
+                                 widths = unit(w_s1, "in"),
+                                 heights = unit(h_s1, "in"))
+save_grob(arr_s1, "./figures/Figure_S1.pdf", w_s1, sum(h_s1))
+```
+
+### Core Species Tree
+
+```{r core_species_tree, include=FALSE}
+sp_lab <- setNames(sub("^Achromobacter ", "A. ", achromo_md$Taxonomy), achromo_md$key)
+sp_lab["PAO1"] <- "P. aeruginosa (outgroup)"
+tree_species <- sp_lab[sp_tree$tip.label]
+
+tree_fig <- sp_tree
+tree_fig$tip.label <- paste0(sub("DSM", "DSM ", sp_tree$tip.label), "   ", tree_species)
+sup <- tree_fig$node.label
+sup[is.na(sup) | sup %in% c("", "Root", "NA")] <- ""
+
+cairo_pdf("./derivedData/species_tree/species_tree.pdf", width = 8.5, height = 6)
+par(mar = c(1, 1, 1, 1), xpd = NA)
+plot(tree_fig, show.tip.label = TRUE, label.offset = 0.25, cex = 0.82,
+     tip.color = "black", font = 1, edge.width = 1.6, x.lim = c(0, 42))
+ape::nodelabels(sup, frame = "none", cex = 0.58, adj = c(1.15, -0.35),
+                col = "gray35")
+invisible(dev.off())
+```
+
+### Figure S3B
+
+```{r fig_S3B, include=FALSE}
+fig_s3b <- ggplot(alcaligin_df, aes(gene, strain)) +
+  geom_tile(aes(fill = ifelse(present, pident, NA)), color = "gray55",
+            linewidth = 0.4) +
+  geom_point(data = alcaligin_df %>% filter(!present), aes(gene, strain),
+             shape = 4, size = 6, stroke = 1.4, color = "gray45") +
+  scale_fill_gradientn(colors = c("#e3edf6", "#bcd4ea", "#8fb4d9", "#5e8ac0"),
+                       limits = c(30, 100), breaks = seq(30, 100, 10),
+                       oob = scales::squish, na.value = "white",
+                       name = "% Identity\nto Tohama I") +
+  facet_grid(. ~ pathway, scales = "free_x", space = "free_x") +
+  scale_x_discrete(expand = c(0, 0)) +
+  scale_y_discrete(expand = c(0, 0)) +
+  labs(x = NULL, y = NULL) +
+  base_theme() +
+  theme(panel.spacing = unit(6, "pt"),
+        strip.background = element_rect(fill = "gray92", color = "black",
+                                        linewidth = 0.5),
+        strip.text = element_text(size = AXIS_TEXT_PT, face = "bold"),
+        strip.clip = "off",
+        legend.position = "right", legend.key.height = unit(1.4, "cm"))
+
+save_grob(fig_s3b, "./figures/Figure_S3B.pdf", 15, 11)
+```
